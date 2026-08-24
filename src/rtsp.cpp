@@ -193,6 +193,7 @@ namespace rtsp_stream {
     snapshot->device_name = device_name;
     snapshot->client_display_mode_override = client_display_mode_override;
     snapshot->client_display_refresh_millihz = client_display_refresh_millihz;
+	snapshot->enable_mic = enable_mic;
     snapshot->enable_hdr = enable_hdr;
     snapshot->prefer_sdr_10bit = prefer_sdr_10bit;
     snapshot->force_sdr = force_sdr;
@@ -496,7 +497,7 @@ namespace rtsp_stream {
         socket->read();
       });
 
-      auto begin = std::max(socket->begin - 4, socket->begin);
+      auto begin = std::max(socket->begin - 4, socket->msg_buf.data());
       auto buf_size = bytes + (begin - socket->begin);
       auto end = begin + buf_size;
 
@@ -1422,6 +1423,11 @@ namespace rtsp_stream {
     uint32_t encryption_flags_supported = SS_ENC_CONTROL_V2 | SS_ENC_AUDIO;
     uint32_t encryption_flags_requested = SS_ENC_CONTROL_V2;
 
+    if (config::audio.stream_mic) {
+      encryption_flags_supported |= SS_ENC_MICROPHONE;
+      encryption_flags_requested |= SS_ENC_MICROPHONE;
+    }
+
     // Determine the encryption desired for this remote endpoint
     auto encryption_mode = net::encryption_mode_for_address(socket->sock.remote_endpoint().address());
     if (encryption_mode != config::ENCRYPTION_MODE_NEVER) {
@@ -1455,6 +1461,12 @@ namespace rtsp_stream {
       // If we have our own surround parameters, advertise them twice first
       ss << "a=fmtp:97 surround-params="sv << session->surround_params << std::endl;
       ss << "a=fmtp:97 surround-params="sv << session->surround_params << std::endl;
+    }
+
+    if (config::audio.stream_mic) {
+      ss << "m=audio " << net::map_port(stream::MIC_STREAM_PORT) << " RTP/AVP 96" << std::endl;
+      ss << "a=rtpmap:96 opus/48000/1"sv << std::endl;
+      ss << "a=fmtp:96 minptime=10;useinbandfec=1"sv << std::endl;
     }
 
     for (int x = 0; x < audio::MAX_STREAM_CONFIG; ++x) {
@@ -1513,6 +1525,9 @@ namespace rtsp_stream {
       port = net::map_port(stream::VIDEO_STREAM_PORT);
     } else if (type == "control"sv) {
       port = net::map_port(stream::CONTROL_PORT);
+    } else if (type == "mic"sv && config::audio.stream_mic) {
+      port = net::map_port(stream::MIC_STREAM_PORT);
+      session->enable_mic = true;
     } else {
       cmd_not_found(server, socket, session, std::move(req));
       return false;
@@ -1908,6 +1923,14 @@ namespace rtsp_stream {
         config.frame_generation_provider = launch_session->frame_generation_provider;
         config.lossless_scaling_target_fps = launch_session->lossless_scaling_target_fps;
         config.lossless_scaling_rtss_limit = launch_session->lossless_scaling_rtss_limit;
+
+        if (session->enable_mic &&
+            !(config.encryptionFlagsEnabled & SS_ENC_MICROPHONE)) {
+          BOOST_LOG(warning) << "Disabling microphone redirection for ["sv << session->device_name
+                             << "] because the client did not negotiate microphone encryption";
+          audio::mic_debug_on_session_stop("Microphone redirection requires encrypted transport. This client negotiated plaintext microphone packets, so mic passthrough was disabled for the session.");
+          session->enable_mic = false;
+        }
 
         std::shared_ptr<stream::session_t> stream_session;
         bool startup_failed = true;
