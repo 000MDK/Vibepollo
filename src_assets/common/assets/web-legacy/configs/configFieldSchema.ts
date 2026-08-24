@@ -45,6 +45,15 @@ const SWITCH_KEYS = new Set<string>([
   'rtx_hdr_force_sdr',
 ]);
 
+// Settings that are always rendered as a checkbox, regardless of whether a
+// default/current value has been resolved yet. Without this, a checkbox-type
+// setting with no seeded default falls through to isBooleanLike(sampleValue)
+// below, which returns false for `undefined` — so the field renders as a
+// plain text input until the user happens to type a recognized boolean-like
+// value into it (e.g. "true"), at which point it flips to a checkbox. See
+// `stream_mic`, which has no entry in store.defaults.
+const CHECKBOX_KEYS = new Set<string>(['stream_mic']);
+
 const NUMBER_FIELD_OVERRIDES: Record<string, Partial<ConfigFieldDefinition>> = {
   fec_percentage: { placeholder: '20' },
   qp: { placeholder: '28' },
@@ -195,6 +204,13 @@ export function getConfigFieldDefinition(
   if (SWITCH_KEYS.has(key)) {
     return {
       kind: 'switch',
+    };
+  }
+
+  if (CHECKBOX_KEYS.has(key)) {
+    return {
+      kind: 'checkbox',
+      localePrefix: 'config',
     };
   }
 
