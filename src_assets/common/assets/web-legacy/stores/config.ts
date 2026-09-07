@@ -128,6 +128,12 @@ const defaultGroups = [
       virtual_sink: '',
       install_steam_audio_drivers: 'enabled',
       stream_audio: 'enabled',
+      // Backend default is false (config.cpp); must be present here or the
+      // config-object property trap for this key is never installed (see
+      // buildWrapper()), so toggling it in the UI silently fails to persist.
+      stream_mic: 'disabled',
+      mic_backend: 'steam_streaming_microphone',
+      mic_device: '',
       keep_sink_default: 'enabled',
       auto_capture_sink: 'enabled',
       adapter_name: '',

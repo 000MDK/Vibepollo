@@ -282,6 +282,15 @@ function selectVirtualDisplayLayout(v: unknown) {
 
     <ConfigFieldRenderer setting-key="stream_audio" v-model="config.stream_audio" class="mb-3" />
 
+    <ConfigFieldRenderer setting-key="stream_mic" v-model="config.stream_mic" class="mb-3" />
+
+    <ConfigFieldRenderer
+      v-if="config.stream_mic === 'enabled'"
+      setting-key="mic_device"
+      v-model="config.mic_device"
+      class="mb-6"
+    />
+
     <ConfigFieldRenderer
       v-if="config.stream_audio === 'enabled'"
       setting-key="keep_sink_default"
