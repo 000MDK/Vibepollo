@@ -3858,15 +3858,6 @@ namespace proc {
       proc.terminate(false, false);
     }
 
-#ifdef _WIN32
-    // initVDisplayDriver() already performs one bounded readiness/recovery pass.
-    // Repeating it here can outlive the restart cooldown and launch a fresh PnP
-    // cycle on every parse, which stalls secondary instances for minutes.
-    if (vDisplayDriverStatus.load(std::memory_order_acquire) != VDISPLAY::DRIVER_STATUS::OK) {
-      initVDisplayDriver();
-    }
-#endif
-
     auto proc_opt = proc::parse(file_name);
 
     if (!proc_opt) {
