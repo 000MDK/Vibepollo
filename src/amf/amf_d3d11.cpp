@@ -988,6 +988,45 @@ namespace amf {
       if (config.pa_activity_type && !set_verified_int64(AMF_PA_ACTIVITY_TYPE, *config.pa_activity_type, "PA activity type")) return false;
     }
 
+// BEGIN INSERT1 (HEVC GDR configuration)
+// Check if the connected client explicitly requested Intra-Refresh (GDR)
+if (client_config.enableIntraRefresh == 1) {
+  AMF_RESULT probe_res = encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, 120);
+
+  if (probe_res == AMF_OK) {
+    BOOST_LOG(info) << "AMF: Client requested GDR. Initializing driver-autonomous HEVC Intra-Refresh...";
+
+    int64_t gop_size = 120;
+    encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, gop_size);
+
+    int64_t actual_width = encode_width;
+    int64_t actual_height = encode_height;
+
+    if (actual_width <= 0)  actual_width = 3840;
+    if (actual_height <= 0) actual_height = 2160;
+
+    int64_t ctu_size = 64;
+    int64_t ctu_width = (actual_width + (ctu_size - 1)) / ctu_size;
+    int64_t ctu_height = (actual_height + (ctu_size - 1)) / ctu_size;
+
+    int64_t ctu_rows_per_frame = (ctu_height + gop_size - 1) / gop_size;
+    if (ctu_rows_per_frame < 1) ctu_rows_per_frame = 1;
+
+    int64_t total_ctbs_per_frame = ctu_rows_per_frame * ctu_width;
+
+    if (!set_verified_int64(AMF_VIDEO_ENCODER_HEVC_INTRA_REFRESH_NUM_CTBS_PER_SLOT, total_ctbs_per_frame, "HEVC GDR CTBs per Slot")) {
+      return false;
+    }
+
+    BOOST_LOG(info) << "AMF: Native GDR mode successfully activated!";
+  } else {
+    BOOST_LOG(debug) << "AMF: Skipping GDR setup (H.264 or AV1 validation active)";
+  }
+} else {
+  BOOST_LOG(info) << "AMF: Intra-Refresh disabled (not requested by client configuration)";
+}
+// END INSERT1
+
     // NOTE: LOWLATENCY_MODE is intentionally NOT forced here.
     //
     // Previously this block hard-coded AMF_VIDEO_ENCODER_(HEVC_)LOWLATENCY_MODE = true
@@ -1039,61 +1078,28 @@ namespace amf {
       return false;
     }
 
-    // Some AMD drivers regress on pre-RDNA hardware and fail H.264 encoder
-    // creation/initialization outright when USAGE is set to
-    // ULTRA_LOW_LATENCY, even though the same GPU encodes fine at the less
-    // aggressive LOW_LATENCY usage preset. This mirrors the FFmpeg AMF path's
-    // "usage=2" fallback_options entry for h264_amf (see amdvce_legacy in
-    // video.cpp / GPUOpen-LibrariesAndSDKs/AMF#410): retry once, forcing
-    // USAGE = AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY, before giving up on H.264.
-    constexpr amf_int64 kUsageLowLatency = 2;  // AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY
-    const bool allow_h264_usage_fallback =
-      video_format == 0 && (!config.usage || *config.usage != kUsageLowLatency);
-    const int max_attempts = allow_h264_usage_fallback ? 2 : 1;
- 
+    // Create encoder component
+    res = factory->CreateComponent(context, get_codec_id(), &encoder);
+    if (res != AMF_OK || !encoder) {
+      BOOST_LOG(error) << "AMF: CreateComponent failed for codec " << video_format << ", error: " << res;
+      return false;
+    }
 
-    amf_config attempt_config = config;
+    // Configure encoder properties (before Init)
+    if (!configure_encoder(config, client_config, colorspace)) {
+      return false;
+    }
+
+    // Initialize encoder
     auto amf_format = get_amf_format(buffer_format, colorspace.bit_depth);
-    for (int attempt = 0; attempt < max_attempts; ++attempt) {
-      if (attempt > 0) {
-        attempt_config = config;
-        attempt_config.usage = kUsageLowLatency;
-        BOOST_LOG(warning) << "AMF: H.264 encoder creation/initialization failed;"
-                              " retrying with USAGE=LOW_LATENCY (pre-RDNA driver workaround)";
-      }
+    surface_format = amf_format;
+    encode_width = client_config.width;
+    encode_height = client_config.height;
+    res = encoder->Init(amf_format, client_config.width, client_config.height);
 
-      // Create encoder component
-      res = factory->CreateComponent(context, get_codec_id(), &encoder);
-      if (res != AMF_OK || !encoder) {
-        BOOST_LOG(error) << "AMF: CreateComponent failed for codec " << video_format << ", error: " << res;
-        if (attempt + 1 < max_attempts) continue;
-        return false;
-      }
-
-      // Configure encoder properties (before Init)
-      if (!configure_encoder(attempt_config, client_config, colorspace)) {
-        encoder->Terminate();
-        encoder = nullptr;
-        if (attempt + 1 < max_attempts) continue;
-        return false;
-      }
-
-      // Initialize encoder
-      surface_format = amf_format;
-      encode_width = client_config.width;
-      encode_height = client_config.height;
-      res = encoder->Init(amf_format, client_config.width, client_config.height);
-
-      if (res != AMF_OK) {
-        BOOST_LOG(error) << "AMF: encoder Init failed with the requested encode settings, error: " << res;
-        encoder->Terminate();
-        encoder = nullptr;
-        if (attempt + 1 < max_attempts) continue;
-        return false;
-      }
-
-      // Successfully created and initialized the encoder
-      break;
+    if (res != AMF_OK) {
+      BOOST_LOG(error) << "AMF: encoder Init failed with the requested encode settings, error: " << res;
+      return false;
     }
 
     // Some runtimes accept a property before Init but substitute a different
@@ -1892,6 +1898,29 @@ namespace amf {
       disable_rfi_after_property_failure(label, property_result);
       return false;
     };
+
+// BEGIN INSERT2
+// Check if GDR is requested by client
+if (encoder && current_config.enableIntraRefresh == 1) {
+    AMF_RESULT res;
+
+    if (force_idr) {
+        res = surface->SetProperty(AMF_VIDEO_ENCODER_HEVC_FORCE_PICTURE_TYPE, AMF_VIDEO_ENCODER_HEVC_PICTURE_TYPE_NONE);
+        if (res != AMF_OK) {
+            BOOST_LOG(warning) << "AMF GDR: Failed to set FORCE_PICTURE_TYPE (IDR interception)";
+        }
+        res = surface->SetProperty(AMF_VIDEO_ENCODER_HEVC_INSERT_HEADER, true);
+        if (res != AMF_OK) {
+            BOOST_LOG(warning) << "AMF GDR: Failed to set INSERT_HEADER";
+        }
+    } else {
+        res = surface->SetProperty(AMF_VIDEO_ENCODER_HEVC_FORCE_PICTURE_TYPE, AMF_VIDEO_ENCODER_HEVC_PICTURE_TYPE_NONE);
+        if (res != AMF_OK) {
+            BOOST_LOG(warning) << "AMF GDR: Failed to set FORCE_PICTURE_TYPE (Normal operation)";
+        }
+    }
+}
+// END INSERT2
 
     auto set_forced_idr_properties = [&]() {
       auto check = [&](AMF_RESULT property_result, const char *label) {

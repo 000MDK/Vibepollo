@@ -48,6 +48,7 @@ extern "C" {
 #include "sync.h"
 #include "video.h"
 #include "video_encoder_probe_policy.h"
+#include "video_policy.h"
 #include "webrtc_stream.h"
 
 #ifdef _WIN32
@@ -289,29 +290,41 @@ namespace video {
         return mapped;
       };
 
+      std::vector<std::string> active_virtual_outputs;
+      std::vector<std::string> all_virtual_outputs;
       for (const auto &info : virtual_displays) {
-        if (info.is_active) {
-          if (auto mapped = map_to_dxgi_name(info.device_name)) {
-            if (is_dxgi_display_name(*mapped)) {
-              return mapped;
+        if (auto mapped = map_to_dxgi_name(info.device_name)) {
+          if (is_dxgi_display_name(*mapped)) {
+            all_virtual_outputs.push_back(*mapped);
+            if (info.is_active) {
+              active_virtual_outputs.push_back(*mapped);
             }
           }
         }
       }
 
-      for (const auto &info : virtual_displays) {
-        if (auto mapped = map_to_dxgi_name(info.device_name)) {
-          if (is_dxgi_display_name(*mapped)) {
-            return mapped;
-          }
+      std::string configured_virtual_output;
+      const auto configured_output = config::get_active_output_name();
+      if (!configured_output.empty() && VDISPLAY::is_virtual_display_output(configured_output)) {
+        const auto mapped = display_device::map_output_name(configured_output);
+        if (is_dxgi_display_name(mapped)) {
+          configured_virtual_output = mapped;
         }
       }
 
-      return std::nullopt;
+      return policy::select_preferred_virtual_output(
+        configured_virtual_output,
+        active_virtual_outputs,
+        all_virtual_outputs
+      );
     }
 #endif
 
-    bool ensure_virtual_display_ready(std::vector<std::string> &display_names, int &display_index) {
+    bool ensure_virtual_display_ready(
+      std::vector<std::string> &display_names,
+      int &display_index,
+      const bool allow_process_display_preference = true
+    ) {
 #ifdef _WIN32
       static thread_local std::chrono::steady_clock::time_point wait_start {};
       static thread_local std::string pending_virtual_name;
@@ -324,6 +337,12 @@ namespace video {
       }
 
       display_index = std::clamp(display_index, 0, static_cast<int>(display_names.size()) - 1);
+
+      if (!allow_process_display_preference) {
+        wait_start = {};
+        pending_virtual_name.clear();
+        return true;
+      }
 
       if (!should_prefer_virtual_display()) {
         wait_start = {};
@@ -676,6 +695,25 @@ namespace video {
         };
       }
 
+      // A headless or pre-login machine may have no capturable output at all.
+      // Encoder validation uses synthetic surfaces, so resolve the render GPU
+      // directly instead of treating missing WGC/DXGI publication as a missing
+      // encoder target.
+      const auto preferred_adapter = platf::resolve_preferred_render_adapter(
+        config::video.adapter_name,
+        config::video.adapter_pnp_id
+      );
+      if (preferred_adapter) {
+        return probe_target_t {
+          .required_adapter = adapter_id_from_luid(*preferred_adapter.luid),
+          .adapter_identity = probe_adapter_identity_t {
+            .identity = luid_cache_identity(*preferred_adapter.luid),
+            .source = "preferred-render-adapter-without-capture-output",
+            .resolved = true,
+          },
+        };
+      }
+
       return probe_target_t {
         .adapter_identity = probe_adapter_identity_t {
           .identity = "unresolved-automatic-adapter=not-found|output=",
@@ -732,9 +770,9 @@ namespace video {
       append_optional("amd_av1_screen", config::video.amd.amd_av1_screen_content);
       append_optional("amd_av1_latency", config::video.amd.amd_av1_latency_mode);
       // Quarantine changes encoder selection, so it belongs in the key. Once the
-      // gate latches, `amdvce` can no longer build a session; a cached success
+      // gate latches, `amdvce_experimental` can no longer build a session; a cached success
       // from before the quarantine would keep handing back `chosen_encoder =
-      // &amdvce` and every later stream would end before its first packet, even
+      // &amdvce_experimental` and every later stream would end before its first packet, even
       // though the software encoder would have validated. Re-key so the next
       // probe re-runs and selection can degrade to software as designed.
       oss << "|amf_quarantined=" << (native_amf_lifecycle_gate.is_quarantined() ? 1 : 0);
@@ -1543,6 +1581,248 @@ namespace video {
     config_t config;
   };
 
+#ifdef _WIN32
+  SS_HDR_METADATA synthetic_probe_hdr_metadata() {
+    SS_HDR_METADATA metadata {};
+    metadata.displayPrimaries[0] = {35400, 14600};  // Rec.2020 red
+    metadata.displayPrimaries[1] = {8500, 39850};  // Rec.2020 green
+    metadata.displayPrimaries[2] = {6550, 2300};  // Rec.2020 blue
+    metadata.whitePoint = {15635, 16450};  // D65
+    metadata.maxDisplayLuminance = 1000;
+    metadata.minDisplayLuminance = 1;
+    metadata.maxContentLightLevel = 1000;
+    metadata.maxFrameAverageLightLevel = 250;
+    metadata.maxFullFrameLuminance = 400;
+    return metadata;
+  }
+
+  void initialize_synthetic_display_geometry(platf::display_t &display, const config_t &config) {
+    display.width = display.logical_width = display.env_width = display.env_logical_width = std::max(1, config.width);
+    display.height = display.logical_height = display.env_height = display.env_logical_height = std::max(1, config.height);
+  }
+
+  // Encoder validation needs an initialized GPU and shareable surfaces, not a
+  // desktop capture session. Bind D3D to the exact selected adapter so the
+  // cache is owned by the device that actually created the probe surfaces.
+  class synthetic_vram_display_t final: public platf::dxgi::display_vram_t {
+  public:
+    synthetic_vram_display_t(
+      const config_t &config,
+      const std::optional<platf::adapter_id_t> &required_adapter
+    ):
+        hdr_ {config.dynamicRange > 0 && !config.force_sdr} {
+      initialize_synthetic_display_geometry(*this, config);
+      width_before_rotation = width;
+      height_before_rotation = height;
+      capture_format = hdr_ ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
+      next_image_id.store(0, std::memory_order_relaxed);
+
+      if (FAILED(CreateDXGIFactory1(IID_IDXGIFactory1, reinterpret_cast<void **>(&factory)))) {
+        return;
+      }
+
+      for (UINT index = 0;; ++index) {
+        IDXGIAdapter1 *candidate_ptr = nullptr;
+        const auto status = factory->EnumAdapters1(index, &candidate_ptr);
+        if (status == DXGI_ERROR_NOT_FOUND) {
+          break;
+        }
+        if (FAILED(status) || !candidate_ptr) {
+          return;
+        }
+
+        platf::dxgi::adapter_t candidate {candidate_ptr};
+        DXGI_ADAPTER_DESC1 description {};
+        if (FAILED(candidate->GetDesc1(&description)) ||
+            (description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
+          continue;
+        }
+
+        const platf::adapter_id_t candidate_id {
+          .high_part = description.AdapterLuid.HighPart,
+          .low_part = description.AdapterLuid.LowPart,
+        };
+        if (required_adapter && candidate_id != *required_adapter) {
+          continue;
+        }
+        adapter = std::move(candidate);
+        break;
+      }
+
+      if (!adapter) {
+        return;
+      }
+
+      const D3D_FEATURE_LEVEL feature_levels[] {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+      if (FAILED(D3D11CreateDevice(
+            adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+            platf::dxgi::D3D11_CREATE_DEVICE_FLAGS |
+              D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+              D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+            feature_levels, sizeof(feature_levels) / sizeof(D3D_FEATURE_LEVEL), D3D11_SDK_VERSION,
+            &device, &feature_level, &device_ctx))) {
+        device.reset();
+        return;
+      }
+
+      // Query the initialized device rather than trusting the requested
+      // adapter pointer. This is the identity published into the probe cache.
+      platf::dxgi::dxgi_t dxgi;
+      IDXGIAdapter *base_adapter = nullptr;
+      IDXGIAdapter1 *actual_adapter = nullptr;
+      if (FAILED(device->QueryInterface(IID_IDXGIDevice, reinterpret_cast<void **>(&dxgi))) ||
+          FAILED(dxgi->GetAdapter(&base_adapter)) ||
+          FAILED(base_adapter->QueryInterface(IID_IDXGIAdapter1, reinterpret_cast<void **>(&actual_adapter)))) {
+        if (base_adapter) base_adapter->Release();
+        device.reset();
+        return;
+      }
+      base_adapter->Release();
+
+      adapter.reset(actual_adapter);
+      DXGI_ADAPTER_DESC1 actual_description {};
+      if (FAILED(adapter->GetDesc1(&actual_description))) {
+        device.reset();
+        return;
+      }
+      captured_adapter_luid = actual_description.AdapterLuid;
+      const platf::adapter_id_t actual_id {
+        .high_part = captured_adapter_luid.HighPart,
+        .low_part = captured_adapter_luid.LowPart,
+      };
+      if (required_adapter && actual_id != *required_adapter) {
+        BOOST_LOG(error) << "Synthetic encoder probe initialized on a different adapter than requested.";
+        device.reset();
+      }
+    }
+
+    bool valid() const { return static_cast<bool>(device); }
+
+    bool is_hdr() override { return hdr_; }
+
+    bool get_hdr_metadata(SS_HDR_METADATA &metadata) override {
+      if (!hdr_) {
+        std::memset(&metadata, 0, sizeof(metadata));
+        return false;
+      }
+      metadata = synthetic_probe_hdr_metadata();
+      return true;
+    }
+
+    int dummy_img(platf::img_t *img_base) override {
+      if (platf::dxgi::display_vram_t::dummy_img(img_base)) {
+        return -1;
+      }
+      auto *img = static_cast<platf::dxgi::img_d3d_t *>(img_base);
+      const float black[] = {0.0f, 0.0f, 0.0f, 0.0f};
+      device_ctx->ClearRenderTargetView(img->capture_rt.get(), black);
+      return 0;
+    }
+
+    platf::capture_e capture(
+      const push_captured_image_cb_t &push,
+      const pull_free_image_cb_t &pull,
+      bool * /*cursor*/
+    ) override {
+      const auto cadence = std::chrono::milliseconds(1000 / std::max(1, client_frame_rate));
+      for (;;) {
+        std::shared_ptr<platf::img_t> image;
+        if (!pull(image) || !image) return platf::capture_e::ok;
+        if (dummy_img(image.get()) != 0) return platf::capture_e::error;
+        if (!push(std::move(image), true)) return platf::capture_e::ok;
+        std::this_thread::sleep_for(std::max(cadence, std::chrono::milliseconds(1)));
+      }
+    }
+
+  protected:
+    platf::capture_e snapshot(
+      const pull_free_image_cb_t &,
+      std::shared_ptr<platf::img_t> &,
+      std::chrono::milliseconds,
+      bool
+    ) override { return platf::capture_e::error; }
+    platf::capture_e release_snapshot() override { return platf::capture_e::ok; }
+
+  private:
+    bool hdr_;
+  };
+
+  // Software fallback still needs a fake source, but it must not reopen
+  // Desktop Duplication merely to allocate a CPU image.
+  class synthetic_ram_display_t final: public platf::dxgi::display_ram_t {
+  public:
+    synthetic_ram_display_t(
+      const config_t &config,
+      std::optional<platf::adapter_id_t> required_adapter
+    ):
+        adapter_id_ {std::move(required_adapter)},
+        hdr_ {config.dynamicRange > 0 && !config.force_sdr} {
+      initialize_synthetic_display_geometry(*this, config);
+      capture_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    }
+
+    platf::capture_e capture(
+      const push_captured_image_cb_t &,
+      const pull_free_image_cb_t &,
+      bool *
+    ) override { return platf::capture_e::error; }
+
+    std::optional<platf::adapter_id_t> capture_adapter_id() const override {
+      return adapter_id_;
+    }
+
+    bool is_hdr() override { return hdr_; }
+
+    bool get_hdr_metadata(SS_HDR_METADATA &metadata) override {
+      if (!hdr_) {
+        std::memset(&metadata, 0, sizeof(metadata));
+        return false;
+      }
+      metadata = synthetic_probe_hdr_metadata();
+      return true;
+    }
+
+  protected:
+    platf::capture_e snapshot(
+      const pull_free_image_cb_t &,
+      std::shared_ptr<platf::img_t> &,
+      std::chrono::milliseconds,
+      bool
+    ) override { return platf::capture_e::error; }
+    platf::capture_e release_snapshot() override { return platf::capture_e::ok; }
+
+  private:
+    std::optional<platf::adapter_id_t> adapter_id_;
+    bool hdr_;
+  };
+
+  std::shared_ptr<platf::display_t> make_synthetic_probe_display(
+    const platf::mem_type_e type,
+    const config_t &config,
+    const std::optional<platf::adapter_id_t> &required_adapter
+  ) {
+    if (type == platf::mem_type_e::system) {
+      return std::make_shared<synthetic_ram_display_t>(config, required_adapter);
+    }
+
+    auto display = std::make_shared<synthetic_vram_display_t>(config, required_adapter);
+    if (!display->valid()) {
+      return {};
+    }
+    return display;
+  }
+
+  // A protocol video stream is still required for Remote Input, but it must
+  // never open a desktop/WGC/DD capture target. Reuse the synthetic D3D source
+  // and feed black frames at the client cadence.
+  std::shared_ptr<platf::display_t> make_black_display(const config_t &config) {
+    auto display = std::make_shared<synthetic_vram_display_t>(config, std::nullopt);
+    if (!display->valid()) return {};
+    display->client_frame_rate = std::max(1, config.framerate);
+    return display;
+  }
+#endif
+
   struct capture_thread_async_ctx_t {
     std::shared_ptr<safe::queue_t<capture_ctx_t>> capture_ctx_queue;
     std::thread capture_thread;
@@ -1562,7 +1842,6 @@ namespace video {
   void end_capture_async(capture_thread_async_ctx_t &ctx);
 
   // Keep a reference counter to ensure the capture thread only runs when other threads have a reference to the capture thread
-  auto capture_thread_async = safe::make_shared<capture_thread_async_ctx_t>(start_capture_async, end_capture_async);
   auto capture_thread_sync = safe::make_shared<capture_thread_sync_ctx_t>(start_capture_sync, end_capture_sync);
 
 #ifdef _WIN32
@@ -1812,14 +2091,14 @@ namespace video {
     PARALLEL_ENCODING | CBR_WITH_VBR | RELAXED_COMPLIANCE | NO_RC_BUF_LIMIT | YUV444_SUPPORT
   };
 
-  // Native AMD AMF encoder (src/amf/amf_d3d11.cpp). Bypasses the FFmpeg AMF
-  // wrapper for direct AMF SDK access: D3D11 zero-copy input, reference-frame
-  // invalidation and HDR metadata. Selecting amdvce is a strict native-AMF
+  // Experimental native AMD AMF encoder (src/amf/amf_d3d11.cpp). Bypasses the
+  // FFmpeg AMF wrapper for direct AMF SDK access: D3D11 zero-copy input, reference-frame
+  // invalidation and HDR metadata. Selecting amdvce_experimental is a strict native-AMF
   // contract: feature, initialization, or runtime failures are reported instead
-  // of silently changing encoder implementations. amdvce_legacy remains an
-  // explicit user-selected rollback below.
-  encoder_t amdvce {
-    "amdvce"sv,
+  // of silently changing encoder implementations. It is excluded from automatic
+  // probing because hardware and driver coverage is currently limited.
+  encoder_t amdvce_experimental {
+    "amdvce_experimental"sv,
     std::make_unique<encoder_platform_formats_amf>(
       platf::mem_type_e::dxgi,
       platf::pix_fmt_e::nv12,
@@ -1862,10 +2141,10 @@ namespace video {
     PARALLEL_ENCODING | REF_FRAMES_INVALIDATION | ASYNC_TEARDOWN  // flags
   };
 
-  // Legacy FFmpeg-based AMF encoder. This is an explicit rollback target only;
-  // native feature, initialization, and runtime failures never select it.
-  encoder_t amdvce_legacy {
-    "amdvce_legacy"sv,
+  // Supported FFmpeg-based AMF encoder. Its explicit name identifies the
+  // implementation, and it is the AMD encoder selected by automatic probing.
+  encoder_t amdvce_ffmpeg {
+    "amdvce_ffmpeg"sv,
     std::make_unique<encoder_platform_formats_avcodec>(
       AV_HWDEVICE_TYPE_D3D11VA,
       AV_HWDEVICE_TYPE_NONE,
@@ -2151,7 +2430,6 @@ namespace video {
     {
       // Common options
       {
-        {"low_power"s, 1},
         {"async_depth"s, 1},
         {"idr_interval"s, std::numeric_limits<int>::max()},
       },
@@ -2159,16 +2437,12 @@ namespace video {
       {},  // HDR-specific options
       {},  // YUV444 SDR-specific options
       {},  // YUV444 HDR-specific options
-      {
-        // Fallback options
-        {"low_power"s, 0},  // Not all VAAPI drivers expose LP entrypoints
-      },
+      {},  // Fallback options
       "av1_vaapi"s,
     },
     {
       // Common options
       {
-        {"low_power"s, 1},
         {"async_depth"s, 1},
         {"sei"s, 0},
         {"idr_interval"s, std::numeric_limits<int>::max()},
@@ -2177,16 +2451,12 @@ namespace video {
       {},  // HDR-specific options
       {},  // YUV444 SDR-specific options
       {},  // YUV444 HDR-specific options
-      {
-        // Fallback options
-        {"low_power"s, 0},  // Not all VAAPI drivers expose LP entrypoints
-      },
+      {},  // Fallback options
       "hevc_vaapi"s,
     },
     {
       // Common options
       {
-        {"low_power"s, 1},
         {"async_depth"s, 1},
         {"sei"s, 0},
         {"idr_interval"s, std::numeric_limits<int>::max()},
@@ -2195,10 +2465,7 @@ namespace video {
       {},  // HDR-specific options
       {},  // YUV444 SDR-specific options
       {},  // YUV444 HDR-specific options
-      {
-        // Fallback options
-        {"low_power"s, 0},  // Not all VAAPI drivers expose LP entrypoints
-      },
+      {},  // Fallback options
       "h264_vaapi"s,
     },
     // RC buffer size will be set in platform code if supported
@@ -2348,8 +2615,8 @@ namespace video {
 #endif
 #ifdef _WIN32
     &quicksync,
-    &amdvce,
-    &amdvce_legacy,
+    &amdvce_ffmpeg,
+    &amdvce_experimental,
     &mediafoundation,
 #endif
 #if defined(__linux__) || defined(linux) || defined(__linux) || defined(__FreeBSD__)
@@ -2556,7 +2823,27 @@ namespace video {
    * @param display_names The list of display names to repopulate.
    * @param current_display_index The current display index or -1 if not yet known.
    */
-  void refresh_displays(platf::mem_type_e dev_type, std::vector<std::string> &display_names, int &current_display_index, std::string &preferred_display_name) {
+  void refresh_displays(
+    platf::mem_type_e dev_type,
+    std::vector<std::string> &display_names,
+    int &current_display_index,
+    const std::optional<std::string> &required_output = std::nullopt
+  ) {
+    if (required_output && !required_output->empty()) {
+      display_names = platf::display_names(dev_type);
+      const auto exact = std::find_if(display_names.begin(), display_names.end(), [&](const auto &candidate) {
+        return boost::iequals(candidate, *required_output);
+      });
+      if (exact == display_names.end()) {
+        // This is a topology-owned target. Do not reuse a previous list or
+        // index zero because that can silently capture a physical display.
+        display_names.clear();
+        current_display_index = -1;
+        return;
+      }
+      current_display_index = static_cast<int>(std::distance(display_names.begin(), exact));
+      return;
+    }
     // It is possible that the output name may be empty even if it wasn't before (device disconnected) or vice-versa
     const auto runtime_output_override = config::runtime_output_name_override();
     const bool has_runtime_output_override = runtime_output_override.has_value();
@@ -2694,13 +2981,30 @@ namespace video {
     std::shared_ptr<platf::display_t> disp;
 
     while (capture_ctx_queue->running()) {
-      refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+      const auto &capture_config = capture_ctxs.front().config;
+      if (capture_config.capture_source == capture_source_e::synthetic_black) {
+#ifdef _WIN32
+        disp = make_black_display(capture_config);
+        if (disp) break;
+#endif
+        return;
+      }
 
-      if (!ensure_virtual_display_ready(display_names, display_p)) {
+      const auto required_output = capture_config.capture_source == capture_source_e::exact_output ? capture_config.capture_output : std::nullopt;
+      refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, required_output);
+
+      const bool allow_process_display_preference = video::policy::may_apply_process_display_preference(
+        capture_config.capture_source == capture_source_e::active_output ?
+          video::policy::capture_selection_e::process_preferred :
+          video::policy::capture_selection_e::exact_output
+      );
+      if (!ensure_virtual_display_ready(display_names, display_p, allow_process_display_preference)) {
         std::this_thread::sleep_for(50ms);
         continue;
       }
 
+      BOOST_LOG(info) << "Capture worker selecting source=" << static_cast<int>(capture_config.capture_source)
+                      << " output='" << display_names[display_p] << "'.";
       disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
       if (disp) {
         break;
@@ -3000,9 +3304,15 @@ namespace video {
 #endif
 
               // Refresh display names since a display removal might have caused the reinitialization
-              refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, proc::proc.display_name);
+              const auto required_output = capture_ctxs.front().config.capture_source == capture_source_e::exact_output ? capture_ctxs.front().config.capture_output : std::nullopt;
+              refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, required_output);
 
-              if (!ensure_virtual_display_ready(display_names, display_p)) {
+              const bool allow_process_display_preference = video::policy::may_apply_process_display_preference(
+                capture_ctxs.front().config.capture_source == capture_source_e::active_output ?
+                  video::policy::capture_selection_e::process_preferred :
+                  video::policy::capture_selection_e::exact_output
+              );
+              if (!ensure_virtual_display_ready(display_names, display_p, allow_process_display_preference)) {
                 std::this_thread::sleep_for(50ms);
                 continue;
               }
@@ -3697,8 +4007,8 @@ namespace video {
 
 #ifdef _WIN32
         // Only the FFmpeg-based rollback encoder reaches this function; native
-        // "amdvce" builds on encoder_platform_formats_amf and never gets here.
-        if (encoder.name == "amdvce_legacy"sv &&
+        // "amdvce_experimental" builds on encoder_platform_formats_amf and never gets here.
+        if (encoder.name == "amdvce_ffmpeg"sv &&
             config.videoFormat == 1 &&
             config.dynamicRange &&
             sw_fmt == AV_PIX_FMT_P010) {
@@ -4256,7 +4566,7 @@ namespace video {
     if (!acquire_amf_initialization_fence_until(gate_deadline, cancelled)) {
       operation_cancelled = cancelled();
       gate_contended = !operation_cancelled && !native_amf_lifecycle_gate.is_quarantined();
-      BOOST_LOG(error) << "AMF: legacy initialization could not acquire the AMD runtime fence before the session deadline"sv;
+      BOOST_LOG(error) << "AMF: FFmpeg initialization could not acquire the AMD runtime fence before the session deadline"sv;
       return std::nullopt;
     }
     if (cancelled()) {
@@ -4267,12 +4577,12 @@ namespace video {
     if (deadline - std::chrono::steady_clock::now() < 1s) {
       gate_contended = true;
       native_amf_lifecycle_gate.cancel_initialization();
-      BOOST_LOG(warning) << "AMF: legacy initialization skipped because gate contention left less than one second of vendor budget"sv;
+      BOOST_LOG(warning) << "AMF: FFmpeg initialization skipped because gate contention left less than one second of vendor budget"sv;
       return std::nullopt;
     }
 
     auto local_latch = hdr_latch ? *hdr_latch : hdr_latch_t {};
-    auto base_device = make_encode_device(*disp, amdvce_legacy, config, &local_latch, true);
+    auto base_device = make_encode_device(*disp, amdvce_ffmpeg, config, &local_latch, true);
     auto prepared_device = boost::dynamic_pointer_cast<platf::avcodec_encode_device_t>(std::move(base_device));
     if (!prepared_device) {
       native_amf_lifecycle_gate.cancel_initialization();
@@ -4296,9 +4606,9 @@ namespace video {
             }
           });
           try {
-            if (prepared_device->is_codec_supported(amdvce_legacy.codec_from_config(config).name, config)) {
+            if (prepared_device->is_codec_supported(amdvce_ffmpeg.codec_from_config(config).name, config)) {
               prepared_bundle.session = make_encode_session(
-                nullptr, amdvce_legacy, config, width, height, std::move(prepared_device));
+                nullptr, amdvce_ffmpeg, config, width, height, std::move(prepared_device));
             }
             const bool initialized = static_cast<bool>(prepared_bundle.session);
             const bool accepted = handoff->publish(std::move(prepared_bundle));
@@ -4310,7 +4620,7 @@ namespace video {
       };
     } catch (const std::system_error &err) {
       native_amf_lifecycle_gate.cancel_initialization();
-      BOOST_LOG(error) << "AMF: could not start legacy initialization worker: " << err.what();
+      BOOST_LOG(error) << "AMF: could not start FFmpeg initialization worker: " << err.what();
       return std::nullopt;
     }
 
@@ -4320,9 +4630,9 @@ namespace video {
       operation_cancelled = handoff_cancelled;
       if (!handoff_cancelled) {
         native_amf_lifecycle_gate.quarantine_initialization();
-        BOOST_LOG(error) << "AMF: complete legacy D3D/FFmpeg initialization exceeded the vendor deadline; worker will reap ownership"sv;
+        BOOST_LOG(error) << "AMF: complete D3D/FFmpeg initialization exceeded the vendor deadline; worker will reap ownership"sv;
       } else {
-        BOOST_LOG(info) << "AMF: legacy initialization cancelled; worker will reap ownership without quarantining AMD"sv;
+        BOOST_LOG(info) << "AMF: FFmpeg initialization cancelled; worker will reap ownership without quarantining AMD"sv;
       }
       initialization_thread.detach();
       return std::nullopt;
@@ -4352,7 +4662,7 @@ namespace video {
       case amf::lifecycle::teardown_admission_e::granted:
         break;
       case amf::lifecycle::teardown_admission_e::quarantined:
-        BOOST_LOG(error) << "AMF: abandoning the legacy " << reason
+        BOOST_LOG(error) << "AMF: abandoning the FFmpeg " << reason
                          << " session because the AMD runtime is quarantined"sv;
         abandon_quarantined_session(session, std::move(display_lease));
         return false;
@@ -4371,7 +4681,7 @@ namespace video {
       5s);
     native_amf_lifecycle_gate.finish_teardown(completed);
     if (!completed) {
-      BOOST_LOG(error) << "AMF: legacy " << reason << " teardown exceeded 5 seconds; quarantining AMD encoding"sv;
+      BOOST_LOG(error) << "AMF: FFmpeg " << reason << " teardown exceeded 5 seconds; quarantining AMD encoding"sv;
     }
     return completed;
   }
@@ -4471,8 +4781,8 @@ namespace video {
                        &initialization_was_cancelled, &initialization_gate_contended);
 #ifdef _WIN32
     if (initialization_was_cancelled) return encode_run_result_e::completed;
-    if (!session && &encoder == &amdvce) {
-      BOOST_LOG(error) << "AMF: native session initialization failed; refusing silent amdvce_legacy fallback"sv;
+    if (!session && &encoder == &amdvce_experimental) {
+      BOOST_LOG(error) << "AMF: native session initialization failed; refusing silent amdvce_ffmpeg fallback"sv;
     }
 #endif
     if (!session) {
@@ -4484,7 +4794,7 @@ namespace video {
     auto *const native_session = dynamic_cast<amf_encode_session_t *>(session.get());
     const bool native_amf_session = native_session != nullptr;
 #ifdef _WIN32
-    const bool legacy_amf_session = session_encoder == &amdvce_legacy;
+    const bool legacy_amf_session = session_encoder == &amdvce_ffmpeg;
 #else
     const bool legacy_amf_session = false;
 #endif
@@ -4556,11 +4866,11 @@ namespace video {
               case amf::lifecycle::teardown_admission_e::granted:
                 break;
               case amf::lifecycle::teardown_admission_e::quarantined:
-                BOOST_LOG(error) << "AMF: abandoning the legacy session in async teardown because the AMD runtime is quarantined"sv;
+                BOOST_LOG(error) << "AMF: abandoning the FFmpeg session in async teardown because the AMD runtime is quarantined"sv;
                 abandon_quarantined_session(session, std::move(display_lease));
                 return;
               case amf::lifecycle::teardown_admission_e::contended:
-                defer_contended_amf_teardown(std::move(session), std::move(display_lease), "async legacy AMF"sv);
+                defer_contended_amf_teardown(std::move(session), std::move(display_lease), "async FFmpeg AMF"sv);
                 return;
             }
             // Fresh destruction budget once the fence is held — gate contention
@@ -4574,7 +4884,7 @@ namespace video {
               5s);
             native_amf_lifecycle_gate.finish_teardown(completed);
             if (!completed) {
-              BOOST_LOG(error) << "AMF: legacy async teardown exceeded 5 seconds; quarantining AMD encoding until host restart"sv;
+              BOOST_LOG(error) << "AMF: FFmpeg async teardown exceeded 5 seconds; quarantining AMD encoding until host restart"sv;
             }
           } else {
             std::lock_guard lg {encode_session_teardown_mutex};
@@ -4616,11 +4926,11 @@ namespace video {
               case amf::lifecycle::teardown_admission_e::granted:
                 break;
               case amf::lifecycle::teardown_admission_e::quarantined:
-                BOOST_LOG(error) << "AMF: abandoning the legacy session in sync teardown because the AMD runtime is quarantined"sv;
+                BOOST_LOG(error) << "AMF: abandoning the FFmpeg session in sync teardown because the AMD runtime is quarantined"sv;
                 abandon_quarantined_session(session, std::move(legacy_display_lease));
                 return;
               case amf::lifecycle::teardown_admission_e::contended:
-                defer_contended_amf_teardown(std::move(session), std::move(legacy_display_lease), "sync legacy AMF"sv);
+                defer_contended_amf_teardown(std::move(session), std::move(legacy_display_lease), "sync FFmpeg AMF"sv);
                 return;
             }
             std::thread teardown_thread {[session = std::move(session), done = std::move(done), display_lease = std::move(legacy_display_lease)]() mutable {
@@ -5082,8 +5392,8 @@ namespace video {
     std::unique_ptr<platf::encode_device_t> result;
 
 #ifdef _WIN32
-    if (&encoder == &amdvce_legacy && native_amf_lifecycle_gate.is_quarantined()) {
-      BOOST_LOG(error) << "AMF: refusing legacy initialization while the AMD runtime is quarantined"sv;
+    if (&encoder == &amdvce_ffmpeg && native_amf_lifecycle_gate.is_quarantined()) {
+      BOOST_LOG(error) << "AMF: refusing FFmpeg initialization while the AMD runtime is quarantined"sv;
       return nullptr;
     }
 #endif
@@ -5213,7 +5523,7 @@ namespace video {
     bool session_hdr_metadata_valid = false;
     SS_HDR_METADATA session_hdr_metadata {};
 #ifdef _WIN32
-    if (&encoder == &amdvce_legacy) {
+    if (&encoder == &amdvce_ffmpeg) {
       bool legacy_cancelled = false;
       bool legacy_gate_contended = false;
       auto legacy = make_legacy_amf_session_bounded(
@@ -5299,9 +5609,15 @@ namespace video {
       wait_for_recent_display_apply_stability();
 #endif
       // Refresh display names since a display removal might have caused the reinitialization
-      refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+      const auto required_output = synced_session_ctxs.front()->config.capture_source == capture_source_e::exact_output ? synced_session_ctxs.front()->config.capture_output : std::nullopt;
+      refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, required_output);
 
-      if (!ensure_virtual_display_ready(display_names, display_p)) {
+      const bool allow_process_display_preference = video::policy::may_apply_process_display_preference(
+        synced_session_ctxs.front()->config.capture_source == capture_source_e::active_output ?
+          video::policy::capture_selection_e::process_preferred :
+          video::policy::capture_selection_e::exact_output
+      );
+      if (!ensure_virtual_display_ready(display_names, display_p, allow_process_display_preference)) {
         std::this_thread::sleep_for(50ms);
         continue;
       }
@@ -5541,18 +5857,24 @@ namespace video {
     auto shutdown_event = mail->event<bool>(mail::shutdown);
 
     auto images = std::make_shared<img_event_t::element_type>();
-    auto ref = capture_thread_async.ref();
+    // A capture worker belongs to the session's source key. The former shared
+    // worker selected its first context's display for every later context,
+    // which made a second Remote Monitor silently capture the wrong output.
+    capture_thread_async_ctx_t source_ctx {};
+    if (start_capture_async(source_ctx) != 0) {
+      return;
+    }
+    auto stop_source = util::fail_guard([&]() {
+      end_capture_async(source_ctx);
+    });
     auto lg = util::fail_guard([&]() {
       images->stop();
       shutdown_event->raise(true);
     });
-    if (!ref) {
-      return;
-    }
 
-    ref->capture_ctx_queue->raise(capture_ctx_t {images, config});
+    source_ctx.capture_ctx_queue->raise(capture_ctx_t {images, config});
 
-    if (!ref->capture_ctx_queue->running()) {
+    if (!source_ctx.capture_ctx_queue->running()) {
       return;
     }
 
@@ -5579,19 +5901,19 @@ namespace video {
 
     while (!shutdown_event->peek() && images->running()) {
       // Wait for the main capture event when the display is being reinitialized
-      if (ref->reinit_event.peek()) {
+      if (source_ctx.reinit_event.peek()) {
         std::this_thread::sleep_for(20ms);
         continue;
       }
       // Wait for the display to be ready
       std::shared_ptr<platf::display_t> display;
       {
-        auto lg = ref->display_wp.lock();
-        if (ref->display_wp->expired()) {
+        auto lg = source_ctx.display_wp.lock();
+        if (source_ctx.display_wp->expired()) {
           continue;
         }
 
-        display = ref->display_wp->lock();
+        display = source_ctx.display_wp->lock();
       }
 
       auto *enc_ptr = chosen_encoder;
@@ -5602,7 +5924,7 @@ namespace video {
       auto &encoder = *enc_ptr;
       const auto initialization_deadline = std::chrono::steady_clock::now() + 5s;
       initialization_cancel_t initialization_cancelled = [&]() {
-        return shutdown_event->peek() || ref->reinit_event.peek() || !images->running();
+        return shutdown_event->peek() || source_ctx.reinit_event.peek() || !images->running();
       };
 
       std::unique_ptr<platf::encode_device_t> encode_device;
@@ -5612,7 +5934,7 @@ namespace video {
       bool initialization_was_cancelled = false;
       bool initialization_gate_contended = false;
 #ifdef _WIN32
-      if (&encoder == &amdvce_legacy) {
+      if (&encoder == &amdvce_ffmpeg) {
         auto legacy = make_legacy_amf_session_bounded(
           display, config, display->width, display->height, &hdr_latch,
           initialization_deadline, initialization_cancelled,
@@ -5633,8 +5955,8 @@ namespace video {
       }
 #ifdef _WIN32
       if (initialization_was_cancelled) continue;
-      if (!encode_device && !prepared_session && &encoder == &amdvce) {
-        BOOST_LOG(error) << "AMF: native device creation failed; refusing silent amdvce_legacy fallback"sv;
+      if (!encode_device && !prepared_session && &encoder == &amdvce_experimental) {
+        BOOST_LOG(error) << "AMF: native device creation failed; refusing silent amdvce_ffmpeg fallback"sv;
       }
 #endif
       if (initialization_was_cancelled) continue;
@@ -5665,7 +5987,7 @@ namespace video {
         display,
         std::move(encode_device),
         std::move(prepared_session),
-        ref->reinit_event,
+        source_ctx.reinit_event,
         session_encoder,
         &hdr_latch,
         channel_data,
@@ -5675,11 +5997,11 @@ namespace video {
         rtx_hdr_metadata_refresh
       );
 #ifdef _WIN32
-      if (encode_result == encode_run_result_e::native_amf_failed && &session_encoder == &amdvce) {
+      if (encode_result == encode_run_result_e::native_amf_failed && &session_encoder == &amdvce_experimental) {
         // Runtime fatals (TDR, sustained backpressure, output stalls) are
         // classified by the encoder layer as reinit requests. Rebuild the same
         // native session like every other encoder does — never a silent
-        // amdvce_legacy fallback — but stay bounded so a wedged driver cannot
+        // amdvce_ffmpeg fallback — but stay bounded so a wedged driver cannot
         // busy-loop the stream.
         if (native_amf_lifecycle_gate.is_quarantined()) {
           BOOST_LOG(error) << "AMF: native runtime failed while quarantined; ending the stream. Host restart is required before retrying AMD encoding"sv;
@@ -5697,7 +6019,7 @@ namespace video {
 #endif
       if (encode_result == encode_run_result_e::initialization_failed) {
 #ifdef _WIN32
-        if (&session_encoder != &amdvce && &session_encoder != &amdvce_legacy) {
+        if (&session_encoder != &amdvce_experimental && &session_encoder != &amdvce_ffmpeg) {
           continue;
         }
         if (native_amf_lifecycle_gate.is_quarantined()) {
@@ -5743,7 +6065,7 @@ namespace video {
     auto idr_events = mail->event<bool>(mail::idr);
 
     idr_events->raise(true);
-    if (encoder->flags & PARALLEL_ENCODING) {
+    if ((encoder->flags & PARALLEL_ENCODING) || config.capture_source != capture_source_e::active_output) {
       capture_async(std::move(mail), config, channel_data);
     } else {
       safe::signal_t join_event;
@@ -5776,7 +6098,7 @@ namespace video {
     // INPUT_FULL; probing for every other encoder keeps the pre-existing limits
     // so this AMD-only change cannot alter NVENC/QSV/software negotiation.
 #ifdef _WIN32
-    const bool amf_probe = &encoder == &amdvce || &encoder == &amdvce_legacy;
+    const bool amf_probe = &encoder == &amdvce_experimental || &encoder == &amdvce_ffmpeg;
 #else
     const bool amf_probe = false;
 #endif
@@ -5801,7 +6123,7 @@ namespace video {
       auto validate_once = [&]() -> util::optional_t<int> {
         std::unique_ptr<encode_session_t> session;
 #ifdef _WIN32
-        if (&encoder == &amdvce_legacy) {
+        if (&encoder == &amdvce_ffmpeg) {
           bool legacy_cancelled = false;
           bool legacy_gate_contended = false;
           auto legacy = make_legacy_amf_session_bounded(
@@ -5827,7 +6149,7 @@ namespace video {
         }
         auto bounded_probe_teardown = util::fail_guard([&]() {
 #ifdef _WIN32
-          if (&encoder == &amdvce_legacy) {
+          if (&encoder == &amdvce_ffmpeg) {
             destroy_legacy_amf_session_bounded(session, "probe"sv);
             return;
           }
@@ -5929,6 +6251,9 @@ namespace video {
     std::optional<platf::adapter_id_t> *actual_adapter,
     const std::string &probe_display_name
   ) {
+#ifdef _WIN32
+    (void) probe_display_name;
+#endif
     if (actual_adapter) {
       actual_adapter->reset();
     }
@@ -5952,6 +6277,34 @@ namespace video {
       encoder.av1.capabilities.reset();
     };
 
+    const auto reset_probe_display = [&](const config_t &probe_config) {
+#ifdef _WIN32
+      // Encoder capability validation is intentionally independent of WGC,
+      // Desktop Duplication, GDI publication, and the interactive desktop.
+      // A short retry covers transient D3D device creation without waiting for
+      // display topology to converge.
+      disp.reset();
+      for (int attempt = 0; attempt < 2 && !disp; ++attempt) {
+        disp = make_synthetic_probe_display(
+          encoder.platform_formats->dev_type,
+          probe_config,
+          required_adapter
+        );
+        if (!disp && attempt == 0) {
+          std::this_thread::sleep_for(100ms);
+        }
+      }
+#else
+      reset_display(
+        disp,
+        encoder.platform_formats->dev_type,
+        probe_display_name,
+        probe_config,
+        required_adapter
+      );
+#endif
+    };
+
     // First, test encoder viability
     config_t config_max_ref_frames {1920, 1080, 60, 6000, 1000, 1, 1, 1, 0, 0, 0};
     config_t config_autoselect {1920, 1080, 60, 6000, 1000, 1, 0, 1, 0, 0, 0};
@@ -5966,7 +6319,7 @@ namespace video {
         cached_display_matches_required) {
       disp = cached_probe_display;
     } else {
-      reset_display(disp, encoder.platform_formats->dev_type, probe_display_name, config_autoselect, required_adapter);
+      reset_probe_display(config_autoselect);
       cached_probe_display = disp;
       cached_display_type = encoder.platform_formats->dev_type;
     }
@@ -6083,11 +6436,11 @@ namespace video {
 
       const config_t generic_hdr_config = {1920, 1080, 60, 6000, 1000, 1, 0, 3, 1, 1, 0};
 
-      // Reset the display since we're switching from SDR to HDR. Keep probing on the
-      // current active display without attempting a display swap.
-      // Clear the cache since we need a fresh display for HDR testing
+      // Reset the synthetic surface since we're switching from SDR to HDR.
+      // The D3D adapter remains exact while the fake source format changes to
+      // FP16, exercising the real 10-bit encoder conversion path.
       cached_probe_display.reset();
-      reset_display(disp, encoder.platform_formats->dev_type, probe_display_name, generic_hdr_config, required_adapter);
+      reset_probe_display(generic_hdr_config);
       if (!disp) {
         return false;
       }
@@ -6209,15 +6562,6 @@ namespace video {
       return 0;
     }
 
-#ifdef _WIN32
-    if (required_adapter && probe_target.display_name.empty()) {
-      BOOST_LOG(info)
-        << "Encoder probe deferred because the required adapter has no compatible capture output.";
-      update_probe_cache(cache_key, false, false, false, false, false, false);
-      return -1;
-    }
-#endif
-
     if (!allow_encoder_probing()) {
       // Error already logged
       update_probe_cache(cache_key, false, false, false, false, false, false);
@@ -6239,10 +6583,9 @@ namespace video {
     auto encoder_list = encoders;
 #ifdef _WIN32
     const auto amf_selection_policy = amf::lifecycle::encoder_selection_policy(config::video.encoder);
-    // amdvce_legacy is rollback-only. It participates in probing solely when
-    // explicitly selected; native feature or capability failures must remain visible.
-    if (!amf_selection_policy.include_legacy) {
-      encoder_list.erase(std::remove(encoder_list.begin(), encoder_list.end(), &amdvce_legacy), encoder_list.end());
+    // The native encoder is experimental and must never be selected implicitly.
+    if (!amf_selection_policy.include_experimental) {
+      encoder_list.erase(std::remove(encoder_list.begin(), encoder_list.end(), &amdvce_experimental), encoder_list.end());
     }
 #endif
 
@@ -6315,7 +6658,7 @@ namespace video {
         BOOST_LOG(error) << "Couldn't find any working encoder matching ["sv << config::video.encoder << ']';
 #ifdef _WIN32
         if (amf_selection_policy.fail_closed) {
-          BOOST_LOG(error) << "Native AMF was explicitly selected; refusing automatic fallback to amdvce_legacy or another encoder"sv;
+          BOOST_LOG(error) << "Experimental native AMF was explicitly selected; refusing automatic fallback to amdvce_ffmpeg or another encoder"sv;
           return -1;
         }
 #endif
@@ -6383,12 +6726,11 @@ namespace video {
     }
 
     if (new_encoder == nullptr) {
-      const auto output_name = display_device::map_output_name(config::get_active_output_name());
-      BOOST_LOG(fatal) << "Unable to find display or encoder during startup."sv;
-      if (!config::video.adapter_name.empty() || !output_name.empty()) {
-        BOOST_LOG(fatal) << "Please ensure your manually chosen GPU and monitor are connected and powered on."sv;
+      BOOST_LOG(fatal) << "Unable to initialize a working video encoder during startup."sv;
+      if (!config::video.adapter_name.empty() || !config::video.adapter_pnp_id.empty()) {
+        BOOST_LOG(fatal) << "Please ensure the selected GPU is available and its encoder driver is working."sv;
       } else {
-        BOOST_LOG(fatal) << "Please check that a display is connected and powered on."sv;
+        BOOST_LOG(fatal) << "Please check the GPU driver and configured encoder."sv;
       }
       update_probe_cache(cache_key, false, false, false, false, false, false);
       return -1;
@@ -6406,7 +6748,7 @@ namespace video {
       // including native AMF — failed validation. Make the degradation loud:
       // an AMD user should never discover software encoding from stutter alone.
       BOOST_LOG(error) << "No hardware encoder passed validation; the SOFTWARE encoder was selected."sv;
-      BOOST_LOG(error) << "If this system has an AMD GPU, hardware encoding is NOT active. Check the AMD driver and AMF runtime, or set encoder = amdvce_legacy to try the FFmpeg AMF fallback."sv;
+      BOOST_LOG(error) << "If this system has an AMD GPU, hardware encoding is NOT active. Check the AMD driver and FFmpeg AMF availability; the native AMF encoder is experimental and is not selected automatically."sv;
     }
 #endif
 

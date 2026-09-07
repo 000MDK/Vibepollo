@@ -43,11 +43,16 @@
 
 // local includes
 #include "app_catalog_policy.h"
+#include "app_framegen_config.h"
+#include "audio.h"
 #include "config.h"
 #include "crypto.h"
 #include "display_device.h"
 #include "deferred_action.h"
 #include "file_handler.h"
+#ifdef _WIN32
+  #include "remote_display_topology.h"
+#endif
 #include "logging.h"
 #include "platform/common.h"
 #ifdef _WIN32
@@ -63,6 +68,7 @@
   #include "platform/windows/virtual_display_cleanup.h"
   #include "tools/playnite_launcher/focus_utils.h"
   #include "tools/playnite_launcher/lossless_scaling.h"
+  #include "tools/playnite_launcher/lossless_scaling_policy.h"
 
   #include <Psapi.h>
 #endif
@@ -112,6 +118,7 @@ namespace proc {
     constexpr int LOSSLESS_SHARPNESS_MAX = 10;
 
     constexpr const char *ENV_LOSSLESS_PROFILE = "SUNSHINE_LOSSLESS_SCALING_ACTIVE_PROFILE";
+    constexpr const char *ENV_LOSSLESS_ENABLED = "SUNSHINE_LOSSLESS_SCALING_ENABLED";
     constexpr const char *ENV_LOSSLESS_CAPTURE_API = "SUNSHINE_LOSSLESS_SCALING_CAPTURE_API";
     constexpr const char *ENV_LOSSLESS_QUEUE_TARGET = "SUNSHINE_LOSSLESS_SCALING_QUEUE_TARGET";
     constexpr const char *ENV_LOSSLESS_HDR = "SUNSHINE_LOSSLESS_SCALING_HDR";
@@ -889,8 +896,6 @@ namespace proc {
 
   proc_t proc;
 
-  int input_only_app_id = -1;
-  std::string input_only_app_id_str;
   int terminate_app_id = -1;
   std::string terminate_app_id_str;
 
@@ -940,6 +945,7 @@ namespace proc {
       _app(std::move(other._app)),
       _app_launch_time(other._app_launch_time),
       _active_client_uuid(std::move(other._active_client_uuid)),
+      _active_client_vdd_identity_token(other._active_client_vdd_identity_token),
       placebo(other.placebo),
       _process(std::move(other._process)),
       _process_group(std::move(other._process_group)),
@@ -978,6 +984,7 @@ namespace proc {
       _app = std::move(other._app);
       _app_launch_time = other._app_launch_time;
       _active_client_uuid = std::move(other._active_client_uuid);
+      _active_client_vdd_identity_token = other._active_client_vdd_identity_token;
       placebo = other.placebo;
       _process = std::move(other._process);
       _process_group = std::move(other._process_group);
@@ -1234,18 +1241,6 @@ namespace proc {
     return cmd_path.parent_path();
   }
 
-  void proc_t::launch_input_only() {
-    _app_id = input_only_app_id;
-    _app_name = "Remote Input";
-    _app.uuid = REMOTE_INPUT_UUID;
-    _app.terminate_on_pause = true;
-    allow_client_commands = false;
-    placebo = true;
-
-#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
-    system_tray::update_tray_playing(_app_name);
-#endif
-  }
   int proc_t::execute(const ctx_t &app, std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
 #ifdef _WIN32
     std::optional<std::filesystem::path> resolved_lossless_exe_path;
@@ -1256,17 +1251,13 @@ namespace proc {
     _lossless_should_start_support = false;
     _lossless_metadata = {};
 #endif
-    if (_app_id == input_only_app_id) {
-      terminate(false, false, false, true);
-      std::this_thread::sleep_for(1s);
-    } else {
-      // Ensure starting from a clean slate
-      const bool skip_display_revert = launch_session && launch_session->display_config_preapplied;
-      terminate(false, false, skip_display_revert, true);
-    }
+    // Ensure starting from a clean slate.
+    const bool skip_display_revert = launch_session && launch_session->display_config_preapplied;
+    terminate(false, false, skip_display_revert, true);
 
     _app = app;
     _app_id = util::from_view(app.id);
+    audio::app_started();
 #ifdef _WIN32
     // A replacement app owns the streaming display configuration. Any
     // restore deferred by the previous app must not fire at this session's end.
@@ -1275,6 +1266,7 @@ namespace proc {
     _app_name = app.name;
     _launch_session = launch_session;
     _active_client_uuid = launch_session ? launch_session->client_uuid : std::string();
+    _active_client_vdd_identity_token = launch_session ? launch_session->normal_vdd_identity_token : 0;
     allow_client_commands = app.allow_client_commands;
     launch_session->gen1_framegen_fix = _app.gen1_framegen_fix;
     launch_session->gen2_framegen_fix = _app.gen2_framegen_fix;
@@ -1672,6 +1664,7 @@ namespace proc {
 #endif
 
     auto clear_lossless_runtime_env = [&]() {
+      _env[ENV_LOSSLESS_ENABLED] = "";
       _env[ENV_LOSSLESS_PROFILE] = "";
       _env[ENV_LOSSLESS_CAPTURE_API] = "";
       _env[ENV_LOSSLESS_QUEUE_TARGET] = "";
@@ -1690,13 +1683,17 @@ namespace proc {
       _env[ENV_LOSSLESS_LEGACY_AUTO_DETECT] = "";
     };
 
-    const bool lossless_scaling_enabled = _app.lossless_scaling_enabled || _app.lossless_scaling_framegen;
+    const bool lossless_scaling_enabled = playnite_launcher::lossless::policy::should_enable_runtime(
+      _app.lossless_scaling_enabled,
+      _app.lossless_scaling_framegen
+    );
     _env["SUNSHINE_FRAME_GENERATION_PROVIDER"] =
       _app.frame_generation_enabled ? _app.frame_generation_provider : "";
 
     const bool using_lossless_provider = _app.lossless_scaling_framegen &&
                                          boost::iequals(_app.frame_generation_provider, "lossless-scaling");
     if (lossless_scaling_enabled) {
+      _env[ENV_LOSSLESS_ENABLED] = "1";
       _env["SUNSHINE_LOSSLESS_SCALING_FRAMEGEN"] = _app.lossless_scaling_framegen ? "1" : "";
       if (using_lossless_provider && effective_lossless_target) {
         _env["SUNSHINE_LOSSLESS_SCALING_TARGET_FPS"] = std::to_string(*effective_lossless_target);
@@ -1818,6 +1815,7 @@ namespace proc {
       set_int(ENV_LOSSLESS_LAUNCH_DELAY, std::optional<int>(_app.lossless_scaling_launch_delay_seconds));
       set_bool(ENV_LOSSLESS_LEGACY_AUTO_DETECT, std::optional<bool>(_app.lossless_scaling_legacy_auto_detect));
     } else {
+      _env[ENV_LOSSLESS_ENABLED] = "";
       _env["SUNSHINE_LOSSLESS_SCALING_FRAMEGEN"] = "";
       _env["SUNSHINE_LOSSLESS_SCALING_TARGET_FPS"] = "";
       _env["SUNSHINE_LOSSLESS_SCALING_RTSS_LIMIT"] = "";
@@ -2302,7 +2300,18 @@ namespace proc {
 
     // Perform cleanup actions now if needed
     if (_process) {
-      terminate();
+      std::unique_lock<std::mutex> stream_lifecycle_lock {nvhttp::stream_lifecycle_mutex(), std::try_to_lock};
+      if (!stream_lifecycle_lock.owns_lock()) {
+        // Teardown is already in flight on another thread. Blocking here
+        // parks the caller - including the single serverinfo worker, which
+        // made the host undiscoverable for the whole teardown tail
+        // (vibepollo#326). The gate owner performs the cleanup; report
+        // not-running without waiting on it.
+        BOOST_LOG(debug) << "[running] App exited but stream teardown is already in flight; deferring cleanup to the gate owner.";
+        return 0;
+      }
+      BOOST_LOG(info) << "[running] _process.running() is false; calling terminate(). App exited with code ["sv << _process.native_exit_code() << "] for app '" << _app.name << "' (id=" << _app_id << ")";
+      terminate(false, true, false, true);
     }
 
     return 0;
@@ -2522,6 +2531,10 @@ namespace proc {
         std::unique_lock<std::mutex> {nvhttp::stream_lifecycle_mutex()};
     }
 
+    // Mark termination before process teardown so a concurrent final audio
+    // owner restores directly instead of retaining state for the ended app.
+    audio::app_termination_requested();
+
     // App termination can remove a display directly and can continue through
     // process, undo-command, helper, watchdog, and deferred-config cleanup.
     // Keep HTTP encoder probing out of that entire tail.
@@ -2631,6 +2644,18 @@ namespace proc {
 
     _pipe.reset();
 
+#ifdef _WIN32
+    // Release only this app's normal-display role before deciding whether the
+    // process-wide display restore is now allowed. A retained Remote Monitor
+    // role for the same client keeps that display protected.
+    if (!_active_client_uuid.empty() && _active_client_vdd_identity_token != 0) {
+      remote_display_topology::instance().release_normal_game_identity(
+        _active_client_uuid,
+        _active_client_vdd_identity_token
+      );
+    }
+#endif
+
     const bool other_streaming_session_active =
       stream::session::has_shared_runtime_owner();
 
@@ -2694,6 +2719,7 @@ namespace proc {
     }
 
     _active_client_uuid.clear();
+    _active_client_vdd_identity_token = 0;
     _app_launch_time = {};
     _app_id = -1;
     _app_name.clear();
@@ -3484,10 +3510,9 @@ namespace proc {
             ctx.output = parse_env_val(this_env, app_node.value("output", ""));
           }
           if (app_node.contains("display-output")) {
+            // `output` is the app command-log path, not a display selection.
+            // Only the dedicated field represents an explicit display override.
             ctx.output_name_override = parse_env_val(this_env, app_node.value("display-output", ""));
-          } else if (!ctx.output.empty()) {
-            // Backward compatibility for apps saved before display output received its own field.
-            ctx.output_name_override = ctx.output;
           }
           std::string name = parse_env_val(this_env, app_node.value("name", ""));
           if (app_node.contains("cmd")) {
@@ -3775,77 +3800,6 @@ namespace proc {
       ids.insert(ctx.id);
 
       apps.emplace_back(std::move(ctx));
-    }
-
-    // Virtual Display entry
-#ifdef _WIN32
-    if (vDisplayDriverStatus.load(std::memory_order_acquire) == VDISPLAY::DRIVER_STATUS::OK) {
-      proc::ctx_t ctx {};
-      ctx.idx = std::to_string(i);
-      ctx.uuid = VIRTUAL_DISPLAY_UUID;
-      ctx.name = "Virtual Display";
-      ctx.image_path = parse_env_val(this_env, "virtual_desktop.png");
-      ctx.virtual_display = true;
-      ctx.scale_factor = 100;
-      ctx.use_app_identity = false;
-      ctx.per_client_app_identity = false;
-      ctx.allow_client_commands = false;
-      ctx.terminate_on_pause = false;
-
-      ctx.elevated = false;
-      ctx.auto_detach = true;
-      ctx.wait_all = false;
-      ctx.exit_timeout = 5s;
-
-      auto possible_ids = calculate_app_id(ctx.name, ctx.uuid, ctx.image_path, i++);
-      if (ids.count(std::get<0>(possible_ids)) == 0) {
-        // Avoid using index to generate id if possible
-        ctx.id = std::get<0>(possible_ids);
-      } else {
-        // Fallback to include index on collision
-        ctx.id = std::get<1>(possible_ids);
-      }
-      ids.insert(ctx.id);
-
-      apps.emplace_back(std::move(ctx));
-    }
-#endif
-
-    if (config::input.enable_input_only_mode) {
-      // Input Only entry
-      {
-        proc::ctx_t ctx {};
-        ctx.idx = std::to_string(i);
-        ctx.uuid = REMOTE_INPUT_UUID;
-        ctx.name = "Remote Input";
-        ctx.image_path = parse_env_val(this_env, "input_only.png");
-        ctx.virtual_display = false;
-        ctx.scale_factor = 100;
-        ctx.use_app_identity = false;
-        ctx.per_client_app_identity = false;
-        ctx.allow_client_commands = false;
-        ctx.terminate_on_pause = true;  // There's no need to keep an active input only session ongoing
-
-        ctx.elevated = false;
-        ctx.auto_detach = true;
-        ctx.wait_all = true;
-        ctx.exit_timeout = 5s;
-
-        auto possible_ids = calculate_app_id(ctx.name, ctx.uuid, ctx.image_path, i++);
-        if (ids.count(std::get<0>(possible_ids)) == 0) {
-          // Avoid using index to generate id if possible
-          ctx.id = std::get<0>(possible_ids);
-        } else {
-          // Fallback to include index on collision
-          ctx.id = std::get<1>(possible_ids);
-        }
-        ids.insert(ctx.id);
-
-        input_only_app_id_str = ctx.id;
-        input_only_app_id = util::from_view(ctx.id);
-
-        apps.emplace_back(std::move(ctx));
-      }
     }
 
     // Terminate entry

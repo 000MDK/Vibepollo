@@ -61,6 +61,8 @@
 #include "logging.h"
 #include "network.h"
 #include "nvhttp.h"
+#include "remote_display_topology.h"
+#include "remote_session.h"
 #include "platform/common.h"
 #include "rtsp.h"
 #include "session_history.h"
@@ -156,6 +158,51 @@ namespace confighttp {
       }
     }
     return std::nullopt;
+  }
+
+  remote_session::control_e configurable_remote_session(std::string_view uuid) {
+    const auto control = remote_session::identify(0, uuid);
+    return control == remote_session::control_e::input || control == remote_session::control_e::monitor
+             ? control
+             : remote_session::control_e::none;
+  }
+
+  bool ensure_remote_session_apps(nlohmann::json &file_tree) {
+    if (!file_tree.contains("apps") || !file_tree["apps"].is_array()) {
+      file_tree["apps"] = nlohmann::json::array();
+    }
+
+    bool changed = false;
+    for (const auto control : {remote_session::control_e::input, remote_session::control_e::monitor}) {
+      const auto synthetic = remote_session::synthetic(control);
+      const auto artwork = remote_session::synthetic_artwork_filename(control);
+      if (!artwork) {
+        continue;
+      }
+
+      const auto default_image = std::string {"remote-session/"} + std::string {*artwork};
+      const auto index = find_app_index_by_uuid(file_tree["apps"], synthetic.uuid);
+      if (!index) {
+        file_tree["apps"].push_back({
+          {"name", synthetic.title},
+          {"uuid", synthetic.uuid},
+          {"image-path", default_image},
+        });
+        changed = true;
+        continue;
+      }
+
+      auto &app = file_tree["apps"][*index];
+      if (app.value("name", std::string {}) != synthetic.title) {
+        app["name"] = synthetic.title;
+        changed = true;
+      }
+      if (!app.contains("image-path") || !app["image-path"].is_string() || app["image-path"].get<std::string>().empty()) {
+        app["image-path"] = default_image;
+        changed = true;
+      }
+    }
+    return changed;
   }
 
   std::optional<size_t> resolve_app_index_token(const nlohmann::json &apps_node, const std::string &token) {
@@ -1164,6 +1211,8 @@ namespace confighttp {
       bool installed = platf::is_vigem_installed(&version);
       nlohmann::json out;
       out["installed"] = installed;
+      // ViGEmBus is only a requirement when nothing else can provide a virtual controller.
+      out["required"] = !platf::is_virtual_gamepad_driver_available();
       if (!version.empty()) {
         out["version"] = version;
       }
@@ -1468,7 +1517,7 @@ namespace confighttp {
       headers.emplace("Content-Type", std::string {content_type});
       headers.emplace("Cache-Control", cache_immutable ? "public, max-age=31536000, immutable" : "no-cache");
       headers.emplace("Content-Security-Policy",
-                      "default-src 'self'; base-uri 'self'; connect-src 'self' https://raw.githubusercontent.com wss:; font-src 'self'; "
+                      "default-src 'self'; base-uri 'self'; connect-src 'self' https://api.github.com https://raw.githubusercontent.com wss:; font-src 'self'; "
                       "form-action 'self'; frame-ancestors 'none'; img-src 'self' https://images.igdb.com data: blob:; media-src 'self' blob:; "
                       "object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:");
       headers.emplace("Referrer-Policy", "no-referrer");
@@ -1701,7 +1750,7 @@ namespace confighttp {
         "lossless-scaling-launch-delay"
       };
 
-      bool mutated = false;
+      bool mutated = ensure_remote_session_apps(file_tree);
       auto normalize_lossless_profile_overrides = [](nlohmann::json &node) -> bool {
         if (!node.is_object()) {
           return false;
@@ -1816,6 +1865,7 @@ namespace confighttp {
       if (mutated) {
         try {
           file_handler::write_file(config::stream.file_apps.c_str(), file_tree.dump(4));
+          proc::refresh(config::stream.file_apps, false);
         } catch (std::exception &e) {
           BOOST_LOG(warning) << "GetApps persist normalization failed: "sv << e.what();
         }
@@ -1846,6 +1896,10 @@ namespace confighttp {
               if (v) {
                 app["image-version"] = v;
               }
+            }
+            const auto control = configurable_remote_session(app.value("uuid", ""));
+            if (control != remote_session::control_e::none) {
+              app["remote-session"] = control == remote_session::control_e::input ? "input" : "monitor";
             }
           } catch (...) {
           }
@@ -1957,6 +2011,14 @@ namespace confighttp {
       // Remove old field to avoid duplication
       input_tree.erase("dlss-framegen-capture-fix");
 #endif
+
+      const auto remote_control = configurable_remote_session(input_tree.value("uuid", ""));
+      input_tree.erase("remote-session");
+      if (remote_control != remote_session::control_e::none) {
+        const auto synthetic = remote_session::synthetic(remote_control);
+        input_tree["uuid"] = synthetic.uuid;
+        input_tree["name"] = synthetic.title;
+      }
 
       auto &apps_node = file_tree["apps"];
       if (!apps_node.is_array()) {
@@ -2436,6 +2498,18 @@ namespace confighttp {
         }
       }
 
+      std::optional<size_t> protected_index;
+      if (uuid && !uuid->empty()) {
+        protected_index = find_app_index_by_uuid(apps_node, *uuid);
+      } else if (target_index && *target_index < apps_node.size()) {
+        protected_index = *target_index;
+      }
+      if (protected_index &&
+          configurable_remote_session(apps_node[*protected_index].value("uuid", "")) != remote_session::control_e::none) {
+        bad_request(response, request, "Remote session applications cannot be deleted");
+        return;
+      }
+
       nlohmann::json::array_t new_apps;
       new_apps.reserve(apps_node.size());
 
@@ -2527,6 +2601,67 @@ namespace confighttp {
     // The list changes immediately after pair/unpair. Avoid serving an old empty
     // list from an HTTP cache after the client state has changed.
     send_response(response, output_tree, "no-store");
+  }
+
+  void refresh_remote_display_physical_baseline() {
+    try {
+      const auto devices = nlohmann::json::parse(display_helper_integration::enumerate_devices_json(display_device::DeviceEnumerationDetail::Full));
+      if (!devices.is_array()) return;
+      std::vector<remote_display_topology::node_t> nodes;
+      for (const auto &device : devices) {
+        const auto id = device.value("device_id", "");
+        const auto label = device.value("friendly_name", device.value("display_name", id));
+        if (id.empty() || boost::algorithm::icontains(label, "virtual display")) continue;
+        remote_display_topology::node_t node;
+        node.id = id;
+        node.label = label;
+        node.physical = true;
+        const auto info = device.value("info", nlohmann::json::object());
+        node.active = info.value("active", true);
+        node.primary = info.value("primary", false);
+        nodes.push_back(std::move(node));
+      }
+      remote_display_topology::instance().set_physical_baseline(std::move(nodes));
+    } catch (const std::exception &e) {
+      BOOST_LOG(warning) << "Remote display layout could not refresh physical monitor baseline: " << e.what();
+    }
+  }
+
+  void getClientDisplayLayout(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+    print_req(request);
+    refresh_remote_display_physical_baseline();
+    const auto clients = nvhttp::get_all_clients();
+    std::vector<nlohmann::json> client_nodes;
+    for (const auto &client : clients) client_nodes.push_back(client);
+    auto output = remote_display_topology::instance().snapshot(client_nodes);
+    output["layout"] = nvhttp::get_remote_display_layout();
+    send_response(response, output, "no-store");
+  }
+
+  void putClientDisplayLayout(resp_https_t response, req_https_t request) {
+    if (!check_content_type(response, request, "application/json") || !authenticate(response, request)) return;
+    print_req(request);
+    refresh_remote_display_physical_baseline();
+    try {
+      std::stringstream body;
+      body << request->content.rdbuf();
+      const auto layout = nlohmann::json::parse(body);
+      std::string error;
+      if (!nvhttp::set_remote_display_layout(layout, error)) {
+        bad_request(response, request, error);
+        return;
+      }
+      const auto clients = nvhttp::get_all_clients();
+      std::vector<nlohmann::json> client_nodes;
+      for (const auto &client : clients) client_nodes.push_back(client);
+      auto output = remote_display_topology::instance().snapshot(client_nodes);
+      output["layout"] = nvhttp::get_remote_display_layout();
+      output["applies_on_next_activation"] = true;
+      send_response(response, output, "no-store");
+    } catch (const std::exception &e) {
+      bad_request(response, request, e.what());
+    }
   }
 
 #ifdef _WIN32
@@ -4566,6 +4701,34 @@ namespace confighttp {
 
 #ifdef _WIN32
   /**
+   * @brief Execute the same terminal virtual-display cleanup as the restore hotkey.
+   * @api_examples{/api/display/terminate_virtual| POST| {"status":true}}
+   */
+  void postTerminateVirtualDisplay(resp_https_t response, req_https_t request) {
+    if (!check_content_type(response, request, "application/json")) {
+      return;
+    }
+    if (!authenticate(response, request)) {
+      return;
+    }
+    print_req(request);
+
+    nlohmann::json out;
+    const auto result = platf::virtual_display_cleanup::terminate_all("maintenance_api");
+    out["status"] = result.virtual_displays_removed;
+    out["driver_watchdog_stopped"] = true;
+    out["recovery_disengaged"] = true;
+    out["virtual_displays_removed"] = result.virtual_displays_removed;
+    out["restore_dispatched"] = result.helper_revert_dispatched;
+    out["database_restore_applied"] = result.database_restore_applied;
+    out["watchdogs_stopped"] = true;
+    if (!result.virtual_displays_removed) {
+      out["error"] = "One or more managed virtual displays could not be removed.";
+    }
+    send_response(response, out, "no-store");
+  }
+
+  /**
    * @brief Export the current Windows display settings as a golden restore snapshot.
    * @api_examples{/api/display/export_golden| POST| {"status":true}}
    */
@@ -5500,12 +5663,16 @@ namespace confighttp {
     output_tree["version"] = version_str;
     output_tree["version_compatible"] = version_compatible;
     output_tree["packaged_version"] = VIGEMBUS_PACKAGED_VERSION;
+    // Drives whether the UI presents a missing ViGEmBus as a problem or as an
+    // unused option: Vibeshine's own driver provides controllers without it.
+    output_tree["required"] = !platf::is_virtual_gamepad_driver_available();
 #else
     output_tree["error"] = "ViGEmBus is only available on Windows";
     output_tree["installed"] = false;
     output_tree["version"] = "";
     output_tree["version_compatible"] = false;
     output_tree["packaged_version"] = "";
+    output_tree["required"] = false;
 #endif
 
     send_response(response, output_tree);
@@ -5779,6 +5946,7 @@ namespace confighttp {
     register_api_route("^/api/quit$", "POST", quit);
     register_blocking_api_route("^/api/reset-display-device-persistence$", "POST", resetDisplayDevicePersistence);
 #if defined(_WIN32)
+    register_blocking_api_route("^/api/display/terminate_virtual$", "POST", postTerminateVirtualDisplay);
     register_blocking_api_route("^/api/display/export_golden$", "POST", postExportGoldenDisplay);
     register_blocking_api_route("^/api/display/golden_status$", "GET", getGoldenStatus);
     register_api_route("^/api/display/golden$", "DELETE", deleteGolden);
@@ -5799,6 +5967,8 @@ namespace confighttp {
     register_api_route("^/api/apps/([0-9]+)$", "DELETE", deleteApp);
     register_api_route("^/api/clients/unpair-all$", "POST", unpairAll);
     register_api_route("^/api/clients/list$", "GET", getClients);
+    register_api_route("^/api/clients/display-layout$", "GET", getClientDisplayLayout);
+    register_api_route("^/api/clients/display-layout$", "PUT", putClientDisplayLayout);
     register_api_route("^/api/clients/hdr-profiles$", "GET", getHdrProfiles);
     register_api_route("^/api/clients/update$", "POST", updateClient);
     register_api_route("^/api/clients/unpair$", "POST", unpair);
@@ -5840,10 +6010,12 @@ namespace confighttp {
     register_api_route("^/api/playnite/force_sync$", "POST", postPlayniteForceSync);
     register_blocking_api_route("^/api/playnite/cover$", "POST", postPlayniteCover);
     register_api_route("^/api/playnite/launch$", "POST", postPlayniteLaunch);
-    // Export logs bundle (Windows only)
-    register_api_route("^/api/logs/export$", "GET", downloadPlayniteLogs);
-    register_api_route("^/api/logs/export_crash/manifest$", "GET", getCrashBundleManifest);
-    register_api_route("^/api/logs/export_crash$", "GET", downloadCrashBundle);
+    // Export logs bundle (Windows only). Collection and sanitizing can take
+    // seconds on large log sets; keep it off the single io thread so the rest
+    // of the WebUI stays responsive during an export.
+    register_blocking_api_route("^/api/logs/export$", "GET", downloadPlayniteLogs);
+    register_blocking_api_route("^/api/logs/export_crash/manifest$", "GET", getCrashBundleManifest);
+    register_blocking_api_route("^/api/logs/export_crash$", "GET", downloadCrashBundle);
 #endif
     server.resource["^/images/sunshine.ico$"]["GET"] = getFaviconImage;
     server.resource["^/images/logo-apollo-45.png$"]["GET"] = getApolloLogoImage;

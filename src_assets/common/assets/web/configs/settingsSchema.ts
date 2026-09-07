@@ -8,7 +8,8 @@ export type SettingsFieldKind =
   | 'textarea'
   | 'mode-remapping'
   | 'display-recovery'
-  | 'command-preparations';
+  | 'command-preparations'
+  | 'server-commands';
 
 export interface SettingsOption {
   labelKey: string;
@@ -355,6 +356,29 @@ const virtualDisplayCustomizationFields = (): SettingsField[] => [
   }),
 ];
 
+const remoteMonitorFields = (): SettingsField[] => [
+  boolean('remote_monitor_mute_audio', {
+    labelKey: 'ui.settings.fields.remote_monitor_mute_audio.label',
+    descriptionKey: 'ui.settings.fields.remote_monitor_mute_audio.description',
+    platform: 'windows',
+  }),
+  boolean('remote_monitor_disconnect_on_stream_end', {
+    labelKey: 'ui.settings.fields.remote_monitor_disconnect_on_stream_end.label',
+    descriptionKey: 'ui.settings.fields.remote_monitor_disconnect_on_stream_end.description',
+    platform: 'windows',
+  }),
+  boolean('remote_monitor_disconnect_on_client_disconnect', {
+    labelKey: 'ui.settings.fields.remote_monitor_disconnect_on_client_disconnect.label',
+    descriptionKey: 'ui.settings.fields.remote_monitor_disconnect_on_client_disconnect.description',
+    platform: 'windows',
+  }),
+  boolean('remote_monitor_terminate_on_first_request', {
+    labelKey: 'ui.settings.fields.remote_monitor_terminate_on_first_request.label',
+    descriptionKey: 'ui.settings.fields.remote_monitor_terminate_on_first_request.description',
+    platform: 'windows',
+  }),
+];
+
 const everydayPacingFields = (): SettingsField[] => [
   boolean('frame_limiter_enable', {
     labelKey: 'ui.settings.fields.frame_limiter_enable.label',
@@ -394,6 +418,10 @@ export const settingsCategories: SettingsCategory[] = [
         ],
       },
       {
+        id: 'everyday_remote_monitor',
+        fields: remoteMonitorFields(),
+      },
+      {
         id: 'everyday_resolution',
         fields: [
           modeRemapping({
@@ -411,6 +439,13 @@ export const settingsCategories: SettingsCategory[] = [
             labelKey: 'ui.settings.fields.frame_limiter_auto_virtual_framegen.label',
             descriptionKey: 'ui.settings.fields.frame_limiter_auto_virtual_framegen.description',
             recommended: true,
+            visibleWhen: { key: 'virtual_display_mode', notEquals: 'disabled' },
+          }),
+          boolean('rtss_allow_virtual_display_override', {
+            labelKey: 'ui.settings.fields.rtss_allow_virtual_display_override.label',
+            descriptionKey: 'ui.settings.fields.rtss_allow_virtual_display_override.description',
+            warningKey: 'ui.settings.fields.rtss_allow_virtual_display_override.warning',
+            platform: 'windows',
             visibleWhen: { key: 'virtual_display_mode', notEquals: 'disabled' },
           }),
         ],
@@ -463,6 +498,32 @@ export const settingsCategories: SettingsCategory[] = [
           ),
         ],
       },
+      {
+        id: 'everyday_automation',
+        fields: [
+          {
+            key: 'global_prep_cmd',
+            kind: 'command-preparations',
+            labelKey: 'config.global_prep_cmd',
+            descriptionKey: 'config.global_prep_cmd_desc',
+            stacked: true,
+          },
+          {
+            key: 'global_state_cmd',
+            kind: 'command-preparations',
+            labelKey: 'config.global_state_cmd',
+            descriptionKey: 'config.global_state_cmd_desc',
+            stacked: true,
+          },
+          {
+            key: 'server_cmd',
+            kind: 'server-commands',
+            labelKey: 'config.server_cmd',
+            descriptionKey: 'config.server_cmd_desc',
+            stacked: true,
+          },
+        ],
+      },
     ],
   },
   {
@@ -471,6 +532,10 @@ export const settingsCategories: SettingsCategory[] = [
       {
         id: 'display_virtual',
         fields: [...everydayDisplayFields(), ...virtualDisplayCustomizationFields()],
+      },
+      {
+        id: 'display_remote_monitor',
+        fields: remoteMonitorFields(),
       },
       {
         id: 'display_target',
@@ -584,7 +649,11 @@ export const settingsCategories: SettingsCategory[] = [
               option('back edge sync', 'ui.settings.options.rtss_type.back_edge'),
               option('nvidia reflex', 'ui.settings.options.rtss_type.reflex'),
             ],
-            { platform: 'windows' },
+            {
+              labelKey: 'ui.settings.fields.rtss_frame_limit_type.label',
+              descriptionKey: 'ui.settings.fields.rtss_frame_limit_type.description',
+              platform: 'windows',
+            },
           ),
           integrationPath('lossless_scaling_path', 'lossless', {
             labelKey: 'ui.settings.fields.lossless_scaling_path.label',
@@ -604,6 +673,21 @@ export const settingsCategories: SettingsCategory[] = [
           boolean('keyboard'),
           boolean('mouse'),
           boolean('controller'),
+          select(
+            'gamepad',
+            [
+              option('auto', '_common.auto'),
+              option('x360', 'config.gamepad_x360'),
+              option('ds4', 'config.gamepad_ds4'),
+              option('vhf', 'config.gamepad_vhf'),
+              option('vhf_xbox', 'config.gamepad_vhf_xbox'),
+              option('vhf_xbox_one', 'config.gamepad_vhf_xbox_one'),
+              option('vhf_ds4', 'config.gamepad_vhf_ds4'),
+              option('vhf_ds5', 'config.gamepad_vhf_ds5'),
+              option('vhf_switch', 'config.gamepad_vhf_switch'),
+            ],
+            { platform: 'windows' },
+          ),
           boolean('motion_as_ds4'),
           boolean('touchpad_as_ds4'),
           boolean('ds4_back_as_touchpad_click'),
@@ -740,18 +824,6 @@ export const settingsCategories: SettingsCategory[] = [
         ],
       },
       {
-        id: 'host_commands',
-        fields: [
-          {
-            key: 'global_prep_cmd',
-            kind: 'command-preparations',
-            labelKey: 'config.global_prep_cmd',
-            descriptionKey: 'config.global_prep_cmd_desc',
-            stacked: true,
-          },
-        ],
-      },
-      {
         id: 'host_history',
         fields: [
           boolean('session_history_enabled'),
@@ -795,12 +867,17 @@ export const settingsCategories: SettingsCategory[] = [
 export const settingsDefaults: Record<string, unknown> = {
   virtual_display_mode: 'per_client',
   virtual_display_layout: 'exclusive',
+  remote_monitor_mute_audio: false,
+  remote_monitor_disconnect_on_stream_end: false,
+  remote_monitor_disconnect_on_client_disconnect: false,
+  remote_monitor_terminate_on_first_request: false,
   dd_virtual_display_scale: -1,
   frame_limiter_enable: false,
   frame_limiter_provider: 'auto',
   frame_limiter_fps_limit: 0,
   frame_limiter_auto_virtual_framegen: 'enabled',
   frame_limiter_disable_vsync: false,
+  rtss_allow_virtual_display_override: false,
   capture: '',
   stream_audio: true,
   controller: true,
@@ -873,6 +950,8 @@ export const settingsDefaults: Record<string, unknown> = {
   notify_pre_releases: false,
   min_log_level: 2,
   global_prep_cmd: [],
+  global_state_cmd: [],
+  server_cmd: [],
   session_history_enabled: true,
   session_history_ttl_days: 0,
   session_history_db_size_limit_mb: 0,

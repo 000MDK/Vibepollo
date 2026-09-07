@@ -20,6 +20,7 @@ import ClientSettingsEditor, {
   type DisplayDevice,
   type HdrProfileEntry,
 } from '@/components/devices/ClientSettingsEditor.vue';
+import DisplayTopologyEditor from '@/components/devices/DisplayTopologyEditor.vue';
 import { settingsDefaults } from '@/configs/settingsSchema';
 import { formatRelativeTime } from '@/utils/format';
 
@@ -162,6 +163,15 @@ function normalizeCommands(value: unknown): ClientCommandEntry[] {
     if (!command) return [];
     return [{ command, elevated: Boolean((entry as Record<string, unknown>).elevated) }];
   });
+}
+
+function serializeCommands(commands: ClientCommandEntry[]): ClientCommandEntry[] {
+  return commands.reduce<ClientCommandEntry[]>((result, entry) => {
+    const command = entry.command.trim();
+    if (!command) return result;
+    result.push({ command, elevated: entry.elevated === true });
+    return result;
+  }, []);
 }
 
 function normalizeVirtualMode(value: unknown): ClientDeviceDraft['virtualDisplayMode'] {
@@ -416,8 +426,14 @@ function updatePayload(device: PairedDevice, draft: ClientDeviceDraft): Record<s
     perm: draft.permissions & PERMISSION_ALL,
     enable_legacy_ordering: draft.enableLegacyOrdering,
     allow_client_commands: draft.allowClientCommands,
-    do: draft.doCommands.map((entry) => ({ cmd: entry.command.trim(), elevated: entry.elevated })),
-    undo: draft.undoCommands.map((entry) => ({ cmd: entry.command.trim(), elevated: entry.elevated })),
+    do: serializeCommands(draft.doCommands).map((entry) => ({
+      cmd: entry.command,
+      elevated: entry.elevated,
+    })),
+    undo: serializeCommands(draft.undoCommands).map((entry) => ({
+      cmd: entry.command,
+      elevated: entry.elevated,
+    })),
     display_mode: draft.displayMode.trim(),
     output_name_override: outputName,
     always_use_virtual_display:
@@ -444,6 +460,8 @@ const draftScalarKeys = [
   'permissions',
   'enableLegacyOrdering',
   'allowClientCommands',
+  'doCommands',
+  'undoCommands',
   'displayMode',
   'displayOverrideEnabled',
   'displaySelection',
@@ -646,6 +664,8 @@ onBeforeUnmount(() => {
         </RouterLink>
       </template>
     </PageHeader>
+
+    <DisplayTopologyEditor />
 
     <div class="devices-stack">
       <InlineAlert

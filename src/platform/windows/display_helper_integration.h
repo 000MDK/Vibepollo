@@ -60,7 +60,11 @@ namespace display_helper_integration {
 
   // Launch the helper (if needed) and send REVERT.
   // Returns true if the helper accepted the command; false to allow fallback.
-  bool revert(bool prefer_golden_if_current_missing = true);
+  // Terminal user actions may explicitly override managed display ownership.
+  bool revert(
+    bool prefer_golden_if_current_missing = true,
+    bool override_managed_ownership = false
+  );
 
   // Attempt to cancel any pending restore/revert requests on a running helper.
   // Returns true if a DISARM command was sent successfully.
@@ -105,6 +109,10 @@ namespace display_helper_integration {
   // discovery can retain a temporary virtual display that stream creation
   // replaces, so its identity must never enter a session topology snapshot.
   std::optional<std::vector<std::vector<std::string>>> capture_physical_topology();
+
+  // Apply a remote-monitor coordinator composition directly. This is not a
+  // stream APPLY/REVERT and deliberately never creates or restores snapshots.
+  bool apply_remote_composed_topology(const DisplayTopologyDefinition &topology);
 
 #ifdef _WIN32
   enum class ApplyVerificationStatus {

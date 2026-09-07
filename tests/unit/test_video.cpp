@@ -16,6 +16,12 @@ namespace {
   };
 }
 
+TEST(CapturePolicy, ExactAndSyntheticSourcesRejectProcessDisplayOverride) {
+  EXPECT_TRUE(video::policy::may_apply_process_display_preference(video::policy::capture_selection_e::process_preferred));
+  EXPECT_FALSE(video::policy::may_apply_process_display_preference(video::policy::capture_selection_e::exact_output));
+  EXPECT_FALSE(video::policy::may_apply_process_display_preference(video::policy::capture_selection_e::synthetic_black));
+}
+
 TEST(EncoderPolicy, SelectsFirstAvailableCapableEncoderWithoutHardwareProbe) {
   FakeEncoderProvider provider;
   provider.values["nvenc"] = {false, true, true};
@@ -50,3 +56,31 @@ INSTANTIATE_TEST_SUITE_P(
     std::make_tuple(9498, video::policy::rational_t {4749, 50})
   )
 );
+
+TEST(VideoOutputPolicy, KeepsConfiguredVirtualOutputWhenAnotherVirtualDisplayEnumeratesFirst) {
+  const std::array<std::string, 2> active_outputs {
+    "\\\\.\\DISPLAY54",
+    "\\\\.\\DISPLAY53",
+  };
+
+  EXPECT_EQ(
+    video::policy::select_preferred_virtual_output(
+      "\\\\.\\display53",
+      active_outputs,
+      active_outputs
+    ),
+    "\\\\.\\DISPLAY53"
+  );
+}
+
+TEST(VideoOutputPolicy, FallsBackToFirstActiveVirtualOutputWithoutConfiguredAffinity) {
+  const std::array<std::string, 2> active_outputs {
+    "\\\\.\\DISPLAY54",
+    "\\\\.\\DISPLAY53",
+  };
+
+  EXPECT_EQ(
+    video::policy::select_preferred_virtual_output("", active_outputs, active_outputs),
+    "\\\\.\\DISPLAY54"
+  );
+}

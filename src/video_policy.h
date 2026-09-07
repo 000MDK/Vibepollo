@@ -7,6 +7,10 @@
 #include <string_view>
 
 namespace video::policy {
+  enum class capture_selection_e : std::uint8_t { process_preferred, exact_output, synthetic_black };
+
+  [[nodiscard]] bool may_apply_process_display_preference(capture_selection_e selection);
+
   struct rational_t {
     int numerator;
     int denominator;
@@ -34,5 +38,11 @@ namespace video::policy {
     std::span<const std::string_view> preference,
     encoder_requirements_t requirements,
     const encoder_capability_provider_t &provider
+  );
+
+  std::optional<std::string> select_preferred_virtual_output(
+    std::string_view configured_output,
+    std::span<const std::string> active_virtual_outputs,
+    std::span<const std::string> all_virtual_outputs
   );
 }  // namespace video::policy

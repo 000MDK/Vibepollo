@@ -224,6 +224,19 @@ target_include_directories(sunshine_test_nanors_headers SYSTEM INTERFACE
 
 enable_testing()
 
+if(WIN32)
+    find_program(SUNSHINE_TEST_POWERSHELL_EXECUTABLE NAMES pwsh powershell)
+    if(SUNSHINE_TEST_POWERSHELL_EXECUTABLE)
+        add_test(
+            NAME test_script_webrtc_build_cleanup
+            COMMAND "${SUNSHINE_TEST_POWERSHELL_EXECUTABLE}"
+                -NoLogo -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_LIST_DIR}/scripts/test_cleanup_webrtc_build_sources.ps1"
+                -RepositoryRoot "${SUNSHINE_TEST_REPOSITORY_ROOT}")
+        set_tests_properties(test_script_webrtc_build_cleanup PROPERTIES LABELS "fast;script")
+    endif()
+endif()
+
 # The foundation target proves that the fast path needs only GTest and the
 # universal test entry. Registrations use the test_fast_ and test_component_
 # naming convention and must declare their exact sources, definitions, and link
@@ -334,6 +347,12 @@ endfunction()
 
 sunshine_register_component(NAME test_component_stream_protocol TEST_SOURCE unit/test_stream.cpp
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/stream_protocol.cpp")
+sunshine_register_component(NAME test_component_remote_session TEST_SOURCE unit/test_remote_session.cpp
+    PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/remote_session.cpp")
+sunshine_register_component(NAME test_component_rtsp_pending_policy TEST_SOURCE unit/test_rtsp_pending_policy.cpp
+    PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/rtsp_pending_policy.cpp")
+sunshine_register_component(NAME test_component_remote_display_topology TEST_SOURCE unit/test_remote_display_topology.cpp
+    PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/remote_display_topology.cpp")
 sunshine_register_component(NAME test_component_config_parse TEST_SOURCE unit/test_config_parse.cpp
     PRODUCT_SOURCES)
 sunshine_register_component(NAME test_component_config_playnite TEST_SOURCE test_config_playnite.cpp
@@ -416,7 +435,8 @@ if(WIN32)
             "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/platform/windows/display_helper_request_policy.cpp"
             "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/platform/windows/display_helper_session_deferral.cpp"
         LINK_LIBRARIES sunshine_test_displaydevice_headers)
-    sunshine_register_component(NAME test_component_startup_display_policy TEST_SOURCE unit/test_startup_display_policy.cpp)
+    sunshine_register_component(NAME test_component_startup_encoder_probe_policy TEST_SOURCE unit/test_startup_encoder_probe_policy.cpp)
+    sunshine_register_component(NAME test_component_audio_visibility_recovery TEST_SOURCE unit/test_audio_visibility_recovery.cpp)
     sunshine_register_component(NAME test_component_display_helper_v2_async_dispatcher TEST_SOURCE unit/test_display_helper_v2_async_dispatcher.cpp
         PRODUCT_SOURCES
             "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/platform/windows/display_helper_v2/diagnostics.cpp"
@@ -482,6 +502,10 @@ if(WIN32)
     sunshine_register_component(NAME test_component_virtual_display_policy TEST_SOURCE unit/platform/windows/test_virtual_display_sunshine.cpp
         PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/platform/windows/virtual_display_identity.cpp"
         DEFINITIONS "SUNSHINE_SOURCE_DIR=\"${SUNSHINE_TEST_REPOSITORY_ROOT}\"")
+    sunshine_register_component(NAME test_component_vhf_gamepad_policy TEST_SOURCE unit/platform/windows/test_vhf_gamepad_policy.cpp
+        PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/platform/windows/vhf_gamepad_policy.cpp"
+        INCLUDE_DIRECTORIES "${SUNSHINE_LIBVIRTUALGAMEPAD_INCLUDE_DIR}"
+        LINK_LIBRARIES sunshine_test_moonlight_headers)
     sunshine_register_component(NAME test_component_virtual_display_cleanup_policy TEST_SOURCE unit/test_virtual_display_cleanup_policy.cpp)
     sunshine_register_component(NAME test_component_lossless_scaling_policy TEST_SOURCE unit/test_lossless_scaling.cpp
         PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/tools/playnite_launcher/lossless_scaling_policy.cpp")

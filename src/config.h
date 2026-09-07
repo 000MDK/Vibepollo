@@ -106,7 +106,7 @@ namespace config {
       std::optional<int> amd_preanalysis;
       std::optional<int> amd_vbaq;  // nullopt = follow usage-preset default
       int amd_coder;
-      // Native AMF encoder (amdvce) tuning knobs.
+      // Native AMF encoder (amdvce_experimental) tuning knobs.
       int amd_ltr_frames;  // Long-term reference frames for RFI (0 = off)
       int amd_input_queue_size;  // AMF input queue depth (0 = driver default)
       // Curated tri-state native-AMF feature knobs. nullopt (auto) leaves the
@@ -157,6 +157,11 @@ namespace config {
 
     virtual_display_mode_e virtual_display_mode;
     virtual_display_layout_e virtual_display_layout;
+
+    bool remote_monitor_mute_audio;  ///< Do not capture or transmit audio for Remote Monitor sessions.
+    bool remote_monitor_disconnect_on_stream_end;  ///< Release a Remote Monitor when its RTSP stream ends.
+    bool remote_monitor_disconnect_on_client_disconnect;  ///< Release a Remote Monitor when its paired client transport disconnects.
+    bool remote_monitor_terminate_on_first_request;  ///< Let extra clients terminate the active game with one Terminate request.
 
     struct dd_t {
       struct workarounds_t {
@@ -375,6 +380,11 @@ namespace config {
     // SyncLimiter mode. One of: "async", "front edge sync", "back edge sync", "nvidia reflex".
     // If empty or unrecognized, SyncLimiter is not modified.
     std::string frame_limit_type;
+
+    // When enabled, the configured SyncLimiter mode may replace the automatic NVIDIA Reflex
+    // policy for virtual-display streams. Game-provided frame generation still selects Reflex
+    // unless the app/client supplies an explicit RTSS mode override.
+    bool allow_virtual_display_override {false};
   };
 
   struct lossless_scaling_t {
