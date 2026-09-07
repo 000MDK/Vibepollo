@@ -7,16 +7,24 @@
       "allow-client-commands": false
     },
     {
+      "allow-client-commands": false,
+      "cmd": "rundll32.exe powrprof.dll,SetSuspendState 0,1,0",
+      "elevated": true,
+      "exit-timeout": 1,
+      "image-path": "sleep.png",
+      "name": "Sleep",
+    },
+    {
       "name": "Steam Big Picture",
       "prep-cmd": [
-        {
-          "do": "",
-          "undo": "steam://close/bigpicture",
-          "elevated": false
-        }
+      {
+        "do": "",
+        "undo": "steam://close/bigpicture",
+        "elevated": false
+      }
       ],
       "detached": [
-        "steam://open/bigpicture"
+      "steam://open/bigpicture"
       ],
       "image-path": "steam.png"
     }
