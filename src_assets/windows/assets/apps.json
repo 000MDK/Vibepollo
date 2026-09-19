@@ -12,7 +12,7 @@
       "elevated": true,
       "exit-timeout": 1,
       "image-path": "sleep.png",
-      "name": "Sleep",
+      "name": "Sleep"
     },
     {
       "name": "Steam Big Picture",
