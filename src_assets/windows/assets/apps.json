@@ -7,6 +7,14 @@
       "allow-client-commands": false
     },
     {
+      "name": "Sleep",
+      "image-path": "sleep.png",
+      "allow-client-commands": false,
+      "cmd": "rundll32.exe powrprof.dll,SetSuspendState 0,1,0",
+      "elevated": true,
+      "exit-timeout": 1
+    },
+    {
       "name": "Steam Big Picture",
       "prep-cmd": [
         {
